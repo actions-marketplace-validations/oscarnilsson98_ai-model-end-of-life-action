@@ -52,6 +52,7 @@ import {
   chooseExitReason,
   combineEvidenceHealth,
   combineScanStatus,
+  NOT_ASSESSED_DIAGNOSTICS,
   scanFingerprint,
 } from "../shared/status.ts";
 import { compact } from "../shared/text.ts";
@@ -70,6 +71,7 @@ import type {
   PolicyInspection,
   Result,
   ScanStatus,
+  SlackNotifyMode,
 } from "../shared/types.ts";
 
 const UNAVAILABLE_SHA256 = canonicalSha256("ai-model-eol/unavailable/v3", null);
@@ -79,6 +81,7 @@ const DEFAULT_INPUTS: ActionInputs = {
   failWithinDays: null,
   allowPartial: null,
   maxFeedAgeDays: DEFAULT_MAX_FEED_AGE_DAYS,
+  slackNotify: "always",
   notificationFailureMode: "fail",
 };
 
@@ -100,6 +103,7 @@ export type RunDependencies = {
   deliverNotification?: (options: {
     webhookUrl: string;
     report: AssessmentReport;
+    notify: SlackNotifyMode;
   }) => Promise<SlackDeliveryResult>;
 };
 
@@ -782,7 +786,11 @@ async function assess(
     const diagnostics = [
       ...resolvedEvent.diagnostics,
       ...comparison.evaluation.diagnostics,
-      ...comparison.baseline.diagnostics,
+      // The target's not-assessed notices describe the tree being merged; the base's
+      // copies are superseded, and would name usage the pull request may have removed.
+      ...comparison.baseline.diagnostics.filter(
+        (diagnostic) => !NOT_ASSESSED_DIAGNOSTICS.has(diagnostic.code),
+      ),
       ...feedDiagnostics(feed, freshness),
     ];
     // Feed staleness degrades only the run's declared coverage. The per-side statuses and
@@ -927,6 +935,7 @@ export async function run(dependencies: RunDependencies = {}): Promise<Assessmen
       const delivery = await deliver({
         webhookUrl: product.inputs.slackWebhook,
         report,
+        notify: product.inputs.slackNotify,
       });
       report.notificationStatus = delivery.status;
       report.notificationReason =

@@ -98,12 +98,16 @@ The action detects static model values in these supported integrations:
 - OpenAI's JavaScript/TypeScript and Python SDKs
 - Anthropic's JavaScript/TypeScript and Python SDKs
 - Google's current Gen AI JavaScript/TypeScript and Python SDKs
-- Amazon Bedrock Runtime calls through the AWS JavaScript SDK and boto3
+- Amazon Bedrock Runtime calls through the AWS JavaScript SDK and boto3 (the current feed publishes no Bedrock lifecycle data; see [feed integrity](#feed-integrity))
 - the Vercel AI SDK's OpenAI, Anthropic, Google, Google Vertex, Azure, Amazon Bedrock, Cohere, Groq, and xAI providers
 - Azure Cognitive Services model deployments in Terraform
 - model-valued environment bindings connected to supported calls
 
 Other tracked UTF-8 files are checked for exact eligible model IDs from the lifecycle feed. Those text-only matches, documentation, examples, tests, dynamic selectors, and ambiguous serving platforms can warn or appear as notices, but never block.
+
+A few model IDs are too short or common to match safely in prose — `o1`, `o3`, `tts`, `whisper`, and `command` among them. Those are matched when they are written as the value of a model key, such as `model: o1`, `"chat_model": "o1"`, `model="o1"`, or `OPENAI_MODEL=o1`, and warn on the same terms as any other text match.
+
+Configuration counts as much as code, because that is often where a deployed model is chosen. An exact model ID in a Kubernetes manifest, Helm values file, compose file, Dockerfile, `.env`, `.tfvars`, workflow, or an ordinary YAML, JSON, or TOML settings file warns just like one in source — as a text match it still never blocks. Files named as examples, such as `.env.example` or `config.sample.yaml`, stay notices, and lockfiles and OpenAPI documents are treated as inventories rather than model choices. A notice whose shutdown is within 30 days — a test that still calls a model, say — is listed in the job summary anyway. The exact rules are in [the detector contract](docs/v3-detector-contract.md#scope-and-noise-classification).
 
 For the Vercel AI SDK, a provider call is read wherever it appears — `generateText({ model: openai("gpt-5") })`, a `const model = openai(id)` held for later, or a middleware wrapper — because the provider call itself is what selects the model. The provider package pins the serving platform, so these resolve and can block on the same terms as the official SDKs. `azure(...)` names a deployment and `bedrock(...)` is polymorphic, so both need a trusted resolution before they block, exactly as their official-SDK counterparts do.
 
@@ -174,6 +178,20 @@ Slack is a snapshot, not a stateful alert subscription. Delivery is attempted on
 
 The message names every blocking and advisory finding in application or deployment scope, with its deadline, the feed's first replacement model, and a link to the provider's deprecation page when the feed supplies one. A match found only in text — the fallback when a repository has no typed SDK call site — is named too and labelled `ADVISORY (text match)`, so an advisory run always says which models it is about. Findings in documentation, test, or example scope are reported as a count and stay in the job summary. The snapshot links back to the workflow run, so the summary, annotations, and any uploaded report are one click away.
 
+A typed call site whose model is computed at runtime — a caller-supplied override, say — has no static value to check. It does not change the result, because nothing in the repository could clear it; instead the job summary states such references once, in a `Not assessed:` line under the scan status, and the `unresolved-references` output lists them. Slack leaves them out, so they never become a daily repeat.
+
+By default every eligible run posts, including a clean one, so the channel shows the check is alive. To hear only when there is something to act on, set `slack-notify: findings`:
+
+```yaml
+- name: Check AI model lifecycle
+  uses: oscarnilsson98/ai-model-end-of-life-action@v3
+  with:
+    slack-webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+    slack-notify: findings
+```
+
+A clean, fully assessed run then posts nothing, and `notification-status` reports `skipped`. A failed or partial scan still posts — during a feed outage, a quiet channel would look exactly like an all-clear — and so does stale checked-in evidence. The choice is made per run, not per change: an unchanged advisory still posts on every scheduled run.
+
 A delivery failure does not change `result` or `scan-status`. It changes `notification-status`, `exit-reason`, and, by default, the final step exit; set `notification-failure-mode: warn` to keep delivery best-effort.
 
 ## Optional runtime-only claims
@@ -217,6 +235,7 @@ All inputs are optional.
 | `allow-partial` | Checked-in policy, otherwise `false` | Permits enforced partial scans to succeed unless they contain a definite breach. |
 | `max-feed-age-days` | `30` | Upstream freshness horizon. An older lifecycle feed makes `scan-status` partial. Set to `""` to disable. |
 | `slack-webhook` | Unset | HTTPS Slack incoming webhook used only for commit targets on `schedule`, `workflow_dispatch`, or `push`; every other event is skipped. |
+| `slack-notify` | `always` | `always` posts a snapshot on every eligible run, clean or not; `findings` posts only when there is a blocking or advisory finding, a failed or partial scan, or stale evidence. |
 | `notification-failure-mode` | `fail` | `fail` or `warn` when configured delivery fails. |
 
 There is intentionally no `models`, `models-file`, workspace path, custom feed URL, or runtime evidence input. The action discovers committed repository evidence and uses the release's reviewed lifecycle-feed contract.
@@ -304,6 +323,8 @@ Publication is bounded separately:
 The current public upstream feed is not typed. The action wraps it with an adapter manifest that classifies the source's few non-model rows by kind, so entries such as reusable prompts and agent builders never enter model matching, and that marks a small set of short ambiguous identifiers ineligible for literal scanning.
 
 Every well-formed upstream row enters the normalized lifecycle feed as soon as the source publishes it. The adapter holds no allowlist: a newly published deprecation is visible on the next run, with no action release required. Authority is bounded by platform rather than by review — a row on a registered serving platform can block an enforced run, while a row on a platform the detector does not know yet is carried as unsupported, nonblocking evidence that can warn but never fail a build. Providers the upstream source adds are supported out of the box: their platform slug is derived from the provider label, and promoting one to blocking authority remains a deliberate registry, display-name and detector change.
+
+A model can only be checked against a platform the feed covers. When your code calls a serving platform the feed publishes nothing for — currently Amazon Bedrock — the job summary says so in a single `Not assessed:` line under the scan status, naming the platform and where it is used, and the report carries a `platform-without-lifecycle-data` notice. It does not warn, annotate, notify Slack, or change `scan-status`. Mapping the model to a covered platform with a checked-in resolution clears it.
 
 Fields the adapter does not read are ignored, so an additive upstream column never fails a run. Malformed rows and duplicate pairs are quarantined one row at a time with a diagnostic and make `scan-status: partial`, so one bad row costs that row rather than the whole feed. Invalid adapter metadata and schema failures still produce `unknown + failed`. A provider label that yields no valid platform slug at all has its rows skipped with a diagnostic and makes `scan-status: partial`; if no row resolves a platform, or no row is well formed at all, the non-empty feed contract fails.
 

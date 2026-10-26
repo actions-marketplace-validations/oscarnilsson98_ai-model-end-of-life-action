@@ -52,6 +52,53 @@ const JS_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".m
  */
 const JSX_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".tsx"]);
 const HCL_EXTENSIONS = new Set([".tf", ".hcl"]);
+const CONFIGURATION_EXTENSIONS = new Set([
+  ".yaml",
+  ".yml",
+  ".json",
+  ".jsonc",
+  ".json5",
+  ".toml",
+  ".ini",
+  ".cfg",
+  ".conf",
+  ".properties",
+  ".env",
+]);
+/** Kubernetes, Helm, Kustomize, and infrastructure trees. */
+const DEPLOYMENT_DIRECTORIES = new Set([
+  "k8s",
+  "kubernetes",
+  "kube",
+  "helm",
+  "charts",
+  "manifests",
+  "kustomize",
+  "deploy",
+  "deployment",
+  "deployments",
+  "infra",
+  "infrastructure",
+]);
+/** Deployment descriptors recognized by their lower-cased file name. */
+const DEPLOYMENT_FILE_NAMES = new Set([
+  "procfile",
+  "serverless.yml",
+  "serverless.yaml",
+  "chart.yml",
+  "chart.yaml",
+  "kustomization.yml",
+  "kustomization.yaml",
+  "skaffold.yaml",
+  "fly.toml",
+  "render.yaml",
+]);
+const DEPLOYMENT_FILE_PATTERN =
+  /^(?:(?:docker-)?compose|values|helmfile)(?:[.-][a-z0-9_.-]*)?\.ya?ml$|^(?:dockerfile|containerfile)(?:\.[a-z0-9_-]+)*$|\.(?:dockerfile|containerfile|tfvars|bicep|tfvars\.json|tf\.json)$/u;
+/** Machine-written inventories that enumerate model IDs without selecting one. */
+const NON_SELECTING_CONFIGURATION_FILE =
+  /^(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.ya?ml|(?:openapi|swagger)(?:[.-][a-z0-9_.-]*)?\.(?:json|ya?ml))$/u;
+const CONFIGURATION_EXAMPLE_PARTS = new Set(["example", "sample", "template", "dist"]);
 const IDENTIFIER_CHARACTER = /^[\p{L}\p{N}\p{M}._:/-]$/u;
 const DIRECT_POLICY_RULES = new Set(
   DETECTOR_RULES.filter((rule) => rule.policyEligible).map((rule) => rule.ruleId),
@@ -1334,48 +1381,367 @@ function analyzeTokens(
 
 const DIRECT_VALUE_TERMINATORS = new Set([",", ")", "}", "]", ";"]);
 
+/**
+ * The last token of a simple value at `valueIndex`: a string, a bare identifier, or a
+ * dotted member chain such as `MODELS.flash.id`. A call, a computed index, and optional
+ * chaining are not simple values, so the chain stops before them and the caller's
+ * terminator check then rejects the expression rather than resolving a prefix of it.
+ */
+function directValueEnd(tokens: readonly Token[], valueIndex: number): number {
+  if (tokens[valueIndex]?.kind !== "identifier") return valueIndex;
+  let end = valueIndex;
+  while (
+    structuralValue(tokens[end + 1]) === "." &&
+    tokens[end + 2]?.kind === "identifier"
+  ) {
+    end += 2;
+  }
+  return end;
+}
+
+/** The dotted source text of the member chain spanning `start` to `end`. */
+function memberPath(tokens: readonly Token[], start: number, end: number): string {
+  const parts: string[] = [];
+  for (let index = start; index <= end; index += 2) {
+    parts.push(tokens[index]?.value ?? "");
+  }
+  return parts.join(".");
+}
+
 function isCompleteDirectValue(
   tokens: readonly Token[],
   valueIndex: number,
   allowLineBoundary = false,
 ): boolean {
   const value = tokens[valueIndex];
-  const next = tokens[valueIndex + 1];
-  if (value === undefined || next === undefined) return value !== undefined;
+  if (value === undefined) return false;
+  const end = directValueEnd(tokens, valueIndex);
+  const last = tokens[end] ?? value;
+  const next = tokens[end + 1];
+  if (next === undefined) return true;
   if (DIRECT_VALUE_TERMINATORS.has(next.value)) return true;
-  return allowLineBoundary && next.line > value.line;
+  return allowLineBoundary && next.line > last.line;
 }
 
+/** The `...` of an object spread, which the lexer emits as three separate dots. */
+function isSpreadAt(tokens: readonly Token[], index: number): boolean {
+  return (
+    structuralValue(tokens[index]) === "." &&
+    structuralValue(tokens[index + 1]) === "." &&
+    structuralValue(tokens[index + 2]) === "."
+  );
+}
+
+/** The index of the `,` closing an object-literal property value, or `close`. */
+function objectValueEnd(
+  tokens: readonly Token[],
+  valueIndex: number,
+  close: number,
+): number {
+  let depth = 0;
+  for (let index = valueIndex; index < close; index += 1) {
+    const value = structuralValue(tokens[index]);
+    if (value === "{" || value === "[" || value === "(") depth += 1;
+    else if (value === "}" || value === "]" || value === ")") depth = Math.max(0, depth - 1);
+    else if (value === "," && depth === 0) return index;
+  }
+  return close;
+}
+
+/**
+ * How deep a nested object literal is read. Repository content is untrusted, so the walk
+ * is bounded rather than trusting the source to be reasonably shaped; a literal nested
+ * past this depth is dropped whole rather than partly recorded.
+ */
+const MAX_OBJECT_PATH_DEPTH = 12;
+
+/** An object key a `.` member chain can reach, and so the only kind worth recording. */
+const IDENTIFIER_KEY = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/**
+ * Record every statically knowable string path of one object literal into `out`. Returns
+ * false when the literal holds a spread, a computed key, or a repeated key: each can
+ * silently change what a recorded key resolves to, and a half-known object would resolve a
+ * selector to the wrong model. A value this pass cannot read is not fatal — it is simply
+ * not a resolvable path, and nothing can reach it by name.
+ */
+function readObjectPaths(
+  tokens: readonly Token[],
+  open: number,
+  close: number,
+  prefix: string,
+  out: Map<string, string>,
+  depth = 0,
+): boolean {
+  if (depth > MAX_OBJECT_PATH_DEPTH) return false;
+  const seen = new Set<string>();
+  let cursor = open + 1;
+  while (cursor < close) {
+    if (structuralValue(tokens[cursor]) === ",") {
+      cursor += 1;
+      continue;
+    }
+    if (isSpreadAt(tokens, cursor)) return false;
+    const keyToken = tokens[cursor];
+    const key =
+      keyToken?.kind === "identifier" || (keyToken?.kind === "string" && keyToken.static)
+        ? keyToken.value
+        : undefined;
+    // A computed `[expr]:` key, a method, and a shorthand property all fail this test.
+    if (key === undefined || structuralValue(tokens[cursor + 1]) !== ":") return false;
+    // A quoted key containing a dot would build a path that collides with a real nested
+    // one — `{ flash: { id: … }, "flash.id": … }` produces `MODELS.flash.id` twice, and
+    // whichever is written last would silently win. Its shape is not knowable here.
+    if (key.includes(".")) return false;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    const valueIndex = cursor + 2;
+    const valueEnd = objectValueEnd(tokens, valueIndex, close);
+    const valueToken = tokens[valueIndex];
+    // Only a key that `.` access can reach is worth recording. Others (`"gpt-4o"`, `0`)
+    // are reachable solely by computed index, which this pass never resolves, so skipping
+    // them loses nothing and cannot collide with a recorded path.
+    if (!IDENTIFIER_KEY.test(key)) {
+      cursor = valueEnd + 1;
+      continue;
+    }
+    if (structuralValue(valueToken) === "{") {
+      const nestedClose = matchingIndex(tokens, valueIndex, "{", "}");
+      if (nestedClose === null || nestedClose > valueEnd) return false;
+      if (
+        !readObjectPaths(tokens, valueIndex, nestedClose, `${prefix}.${key}`, out, depth + 1)
+      ) {
+        return false;
+      }
+    } else if (
+      valueToken?.kind === "string" &&
+      valueToken.static &&
+      valueEnd === valueIndex + 1
+    ) {
+      out.set(`${prefix}.${key}`, valueToken.value);
+    }
+    cursor = valueEnd + 1;
+  }
+  return true;
+}
+
+/**
+ * Dotted paths into same-file object literals, so a registry written as
+ * `const MODELS = { flash: { id: "…" } }` resolves `MODELS.flash.id`. JavaScript only: a
+ * Python dict is a different shape and is not read here.
+ */
+function collectObjectPaths(
+  tokens: readonly Token[],
+  analysis: TokenAnalysis,
+): Map<string, string> {
+  const paths = new Map<string, string>();
+  const declared = new Set<string>();
+  const rejected = new Set<string>();
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (!isIdentifier(tokens[index], "const")) continue;
+    const name = tokens[index + 1];
+    if (
+      name?.kind !== "identifier" ||
+      structuralValue(tokens[index + 2]) !== "=" ||
+      structuralValue(tokens[index + 3]) !== "{"
+    ) {
+      continue;
+    }
+    const root = name.value;
+    const close = matchingIndex(tokens, index + 3, "{", "}");
+    // A name declared twice, reassigned, or bound as a parameter is not one known object.
+    if (
+      close === null ||
+      declared.has(root) ||
+      (analysis.assignmentCounts.get(root) ?? 0) !== 1 ||
+      analysis.parameterNames.has(root)
+    ) {
+      declared.add(root);
+      rejected.add(root);
+      continue;
+    }
+    declared.add(root);
+    const collected = new Map<string, string>();
+    if (readObjectPaths(tokens, index + 3, close, root, collected)) {
+      for (const [path, value] of collected) paths.set(path, value);
+    } else {
+      rejected.add(root);
+    }
+    index = close;
+  }
+  for (const path of [...paths.keys()]) {
+    if (rejected.has(path.slice(0, path.indexOf(".")))) paths.delete(path);
+  }
+  return paths;
+}
+
+/** A same-file value a selector can resolve to, and how that value was established. */
+type ConstantValue = {
+  value: string;
+  trace: EvidenceFact["resolutionTrace"];
+  /**
+   * True when the value is only the static default behind a runtime selector, as in
+   * `override ?? MODELS.flash.id`. The default is knowable but the call's actual model is
+   * not, so the fact stays `selectorKind: "dynamic"` and never becomes policy-eligible.
+   */
+  dynamic: boolean;
+};
+
+/** Everything a value expression in one file can be resolved against. */
+type ConstantTable = {
+  scalars: ReadonlyMap<string, ConstantValue>;
+  objectPaths: ReadonlyMap<string, string>;
+  language: "javascript" | "python";
+};
+
+const EMPTY_SCALARS: ReadonlyMap<string, ConstantValue> = new Map();
+
+/**
+ * The index just past a `??`, `||`, or Python `or` following the value at `valueIndex`,
+ * when the expression is a simple value with a fallback.
+ */
+function staticFallbackIndex(
+  tokens: readonly Token[],
+  valueIndex: number,
+  language: "javascript" | "python",
+): number | undefined {
+  const end = directValueEnd(tokens, valueIndex);
+  const operator = tokens[end + 1];
+  if (language === "python") return isIdentifier(operator, "or") ? end + 2 : undefined;
+  if (operator?.value === "??" || operator?.value === "||") return end + 2;
+  // The lexer pairs `||`, but accepting a split pair costs nothing.
+  if (operator?.value === "|" && tokens[end + 2]?.value === "|") return end + 3;
+  return undefined;
+}
+
+/**
+ * Resolve the value at `valueIndex` without checking what follows it. Callers that have
+ * already established the value's boundary — such as an operand sitting immediately before
+ * a `??` — use this; everything else goes through `staticAtom`.
+ */
+function staticAtomAt(
+  tokens: readonly Token[],
+  valueIndex: number,
+  constants: ConstantTable,
+): ConstantValue | undefined {
+  const token = tokens[valueIndex];
+  if (token?.kind === "string" && token.static) {
+    return {
+      value: token.value,
+      dynamic: false,
+      trace: [{ kind: "detector", detail: "direct static string" }],
+    };
+  }
+  if (token?.kind !== "identifier") return undefined;
+  const end = directValueEnd(tokens, valueIndex);
+  if (end > valueIndex) {
+    const path = memberPath(tokens, valueIndex, end);
+    const value = constants.objectPaths.get(path);
+    return value === undefined
+      ? undefined
+      : {
+          value,
+          dynamic: false,
+          trace: [{ kind: "constant", detail: `same-file object path ${path}` }],
+        };
+  }
+  const constant = constants.scalars.get(token.value);
+  return constant === undefined
+    ? undefined
+    : {
+        ...constant,
+        trace: [
+          { kind: "constant", detail: `same-file constant ${token.value}` },
+          ...constant.trace,
+        ],
+      };
+}
+
+function staticAtom(
+  tokens: readonly Token[],
+  valueIndex: number,
+  constants: ConstantTable,
+  allowLineBoundary = false,
+): ConstantValue | undefined {
+  return isCompleteDirectValue(tokens, valueIndex, allowLineBoundary)
+    ? staticAtomAt(tokens, valueIndex, constants)
+    : undefined;
+}
+
+/**
+ * A value expression that is either a static atom or a runtime selector with a static
+ * default. Constant initializers and call arguments accept the same shapes, so both
+ * resolve through here.
+ */
+function resolveValueExpression(
+  tokens: readonly Token[],
+  valueIndex: number,
+  constants: ConstantTable,
+  allowLineBoundary = false,
+): ConstantValue | undefined {
+  const fallbackIndex = staticFallbackIndex(tokens, valueIndex, constants.language);
+  if (fallbackIndex !== undefined) {
+    // A left operand that already resolves is the value: `??` fires only for null or
+    // undefined, and `||` only for a falsy value, so neither can reach the default once
+    // the left side is a known non-empty string. Reporting the default here would name a
+    // model the call never selects.
+    const left = staticAtomAt(tokens, valueIndex, constants);
+    if (left !== undefined && left.value !== "") return left;
+    const fallback = staticAtom(tokens, fallbackIndex, constants, allowLineBoundary);
+    return fallback === undefined
+      ? undefined
+      : {
+          value: fallback.value,
+          dynamic: true,
+          trace: [
+            { kind: "detector", detail: "static default behind a runtime selector" },
+            ...fallback.trace,
+          ],
+        };
+  }
+  return staticAtom(tokens, valueIndex, constants, allowLineBoundary);
+}
+
+/**
+ * Same-file constants a selector can resolve through. A constant initializer is resolved
+ * against object paths but not against other constants: chaining would depend on
+ * declaration order, and a name invalidated later by the reassignment and shadowing filter
+ * below would already have been baked into an earlier value.
+ */
 function collectConstants(
   tokens: readonly Token[],
   language: "javascript" | "python",
   analysis: TokenAnalysis,
-): Map<string, string> {
-  const candidates = new Map<string, string | null>();
-  const record = (name: string, value: string): void => {
+): ConstantTable {
+  const objectPaths =
+    language === "javascript"
+      ? collectObjectPaths(tokens, analysis)
+      : new Map<string, string>();
+  const atoms: ConstantTable = { scalars: EMPTY_SCALARS, objectPaths, language };
+  const candidates = new Map<string, ConstantValue | null>();
+  const record = (name: string, value: ConstantValue): void => {
     candidates.set(name, candidates.has(name) ? null : value);
   };
-  let braceDepth = 0;
+  const consider = (name: string, valueIndex: number): void => {
+    const resolved = resolveValueExpression(tokens, valueIndex, atoms, true);
+    if (resolved === undefined) return;
+    record(name, {
+      ...resolved,
+      // The constant's own name is the trace entry a reader needs; the atom's
+      // "direct static string" marker would only restate the literal.
+      trace: resolved.trace.filter((entry) => entry.detail !== "direct static string"),
+    });
+  };
   for (let index = 0; index < tokens.length; index += 1) {
     if (language === "javascript") {
-      if (structuralValue(tokens[index]) === "{") {
-        braceDepth += 1;
-        continue;
-      }
-      if (structuralValue(tokens[index]) === "}") {
-        braceDepth = Math.max(0, braceDepth - 1);
-        continue;
-      }
+      // Depth is not tracked: a function-scope `const` is as knowable as a module-level
+      // one once the reassignment and shadowing filter below has run.
       if (
-        braceDepth === 0 &&
         isIdentifier(tokens[index], "const") &&
         tokens[index + 1]?.kind === "identifier" &&
-        tokens[index + 2]?.value === "=" &&
-        tokens[index + 3]?.kind === "string" &&
-        tokens[index + 3]?.static &&
-        isCompleteDirectValue(tokens, index + 3, true)
+        tokens[index + 2]?.value === "="
       ) {
-        record(tokens[index + 1]?.value as string, tokens[index + 3]?.value as string);
+        consider(tokens[index + 1]?.value as string, index + 3);
       }
       continue;
     }
@@ -1383,54 +1749,30 @@ function collectConstants(
     if (
       token?.kind === "identifier" &&
       token.column === 1 &&
-      structuralValue(tokens[index + 1]) === "=" &&
-      tokens[index + 2]?.kind === "string" &&
-      tokens[index + 2]?.static &&
-      isCompleteDirectValue(tokens, index + 2, true)
+      structuralValue(tokens[index + 1]) === "="
     ) {
-      record(token.value, tokens[index + 2]?.value as string);
+      consider(token.value, index + 2);
     }
   }
   const { parameterNames: shadowed, assignmentCounts } = analysis;
-  return new Map(
-    [...candidates.entries()].filter(
-      (entry): entry is [string, string] =>
-        entry[1] !== null &&
-        !shadowed.has(entry[0]) &&
-        (assignmentCounts.get(entry[0]) ?? 0) === 1,
+  return {
+    scalars: new Map(
+      [...candidates.entries()].filter(
+        (entry): entry is [string, ConstantValue] =>
+          entry[1] !== null &&
+          !shadowed.has(entry[0]) &&
+          (assignmentCounts.get(entry[0]) ?? 0) === 1,
+      ),
     ),
-  );
-}
-
-function staticAtom(
-  tokens: readonly Token[],
-  valueIndex: number,
-  constants: ReadonlyMap<string, string>,
-): { modelId: string; trace: EvidenceFact["resolutionTrace"] } | undefined {
-  if (!isCompleteDirectValue(tokens, valueIndex)) return undefined;
-  const token = tokens[valueIndex];
-  if (token?.kind === "string" && token.static) {
-    return {
-      modelId: token.value,
-      trace: [{ kind: "detector", detail: "direct static string" }],
-    };
-  }
-  if (token?.kind === "identifier") {
-    const constant = constants.get(token.value);
-    if (constant !== undefined) {
-      return {
-        modelId: constant,
-        trace: [{ kind: "constant", detail: `same-file constant ${token.value}` }],
-      };
-    }
-  }
-  return undefined;
+    objectPaths,
+    language,
+  };
 }
 
 function resolveTokenValue(
   tokens: readonly Token[],
   valueIndex: number,
-  constants: ReadonlyMap<string, string>,
+  constants: ConstantTable,
   defaultSelectorKind: ModelSelectorKind,
   environmentReference?: EnvironmentReference,
 ): ResolvedValue {
@@ -1441,8 +1783,8 @@ function resolveTokenValue(
       : staticAtom(tokens, environmentReference.fallbackIndex, constants);
     if (fallback !== undefined) {
       return {
-        rawValue: fallback.modelId,
-        modelId: fallback.modelId,
+        rawValue: fallback.value,
+        modelId: fallback.value,
         modelResolution: "resolved",
         selectorKind: "dynamic",
         trace: [
@@ -1468,13 +1810,21 @@ function resolveTokenValue(
       environmentVariable: environmentReference.variable,
     };
   }
-  const resolved = staticAtom(tokens, valueIndex, constants);
+  const resolved = resolveValueExpression(tokens, valueIndex, constants);
   if (resolved !== undefined) {
     return {
-      rawValue: token?.kind === "identifier" ? token.value : resolved.modelId,
-      modelId: resolved.modelId,
+      // A resolved default names the model, not the expression that selected it; a
+      // definite value keeps naming what the call site actually wrote.
+      rawValue: resolved.dynamic
+        ? resolved.value
+        : token?.kind === "identifier"
+          ? memberPath(tokens, valueIndex, directValueEnd(tokens, valueIndex))
+          : resolved.value,
+      modelId: resolved.value,
       modelResolution: "resolved",
-      selectorKind: defaultSelectorKind,
+      // A runtime selector with a static default names the default, not the model this
+      // call will use, so it stays dynamic and never becomes policy-eligible.
+      selectorKind: resolved.dynamic ? "dynamic" : defaultSelectorKind,
       trace: resolved.trace,
     };
   }
@@ -1493,6 +1843,8 @@ type ImportedConstructor = {
 
 type ImportProvenance = {
   constructors: Map<string, ImportedConstructor>;
+  /** Python `import openai [as x]`: a local module name whose constructors are reachable as `x.OpenAI`. */
+  constructorNamespaces: Map<string, string>;
   awsCommands: Map<string, string>;
   googleNamespaces: Set<string>;
   boto3Namespaces: Set<string>;
@@ -1853,7 +2205,7 @@ function aiSdkRuleId(provider: AiSdkProvider): string {
  * the omission fails open with no error.
  */
 export function emittableDetectorRuleIds(): readonly string[] {
-  return AI_SDK_PROVIDERS.map(aiSdkRuleId);
+  return [...AI_SDK_PROVIDERS.map(aiSdkRuleId), KEYED_LEXICAL_RULE_ID];
 }
 
 /**
@@ -1866,6 +2218,11 @@ export function emittableDetectorRuleIds(): readonly string[] {
 function isBareAssignmentTarget(tokens: readonly Token[], index: number): boolean {
   const previous = structuralValue(tokens[index - 1]);
   return previous !== "." && previous !== "?.";
+}
+
+/** Whether the token at `index` is reached through another object, as in `obj.self`. */
+function isMemberAccessBefore(tokens: readonly Token[], index: number): boolean {
+  return !isBareAssignmentTarget(tokens, index);
 }
 
 /**
@@ -1915,8 +2272,10 @@ function pruneUntrustedBindings(
   analysis: TokenAnalysis,
 ): void {
   for (const variable of [...bindings.keys()]) {
+    // `self.client` is counted by its attribute name, the identifier before its `=`.
+    const assigned = variable.includes(".") ? variable.slice(variable.indexOf(".") + 1) : variable;
     if (
-      (analysis.assignmentCounts.get(variable) ?? 0) > 1 ||
+      (analysis.assignmentCounts.get(assigned) ?? 0) > 1 ||
       analysis.parameterNames.has(variable)
     ) {
       bindings.delete(variable);
@@ -2008,6 +2367,7 @@ function importProvenance(
   const constructors = new Map<string, ImportedConstructor>();
   const awsCommands = new Map<string, string>();
   const googleNamespaces = new Set<string>();
+  const constructorNamespaces = new Map<string, string>();
   const boto3Namespaces = new Set<string>();
   const pythonOsNamespaces = new Set<string>();
   const pythonGetenvFunctions = new Set<string>();
@@ -2214,6 +2574,9 @@ function importProvenance(
             : importedModule;
           if (importedModule === "boto3") boto3Namespaces.add(local);
           else if (importedModule === "os") pythonOsNamespaces.add(local);
+          else if (dotted === importedModule && CONSTRUCTORS_BY_MODULE[importedModule] !== undefined) {
+            constructorNamespaces.set(local, importedModule);
+          }
           if (tokens[scan]?.value === "as") scan += 2;
           if (structuralValue(tokens[scan]) !== ",") break;
           cursor = scan + 1;
@@ -2224,6 +2587,7 @@ function importProvenance(
   }
   const importedNames = new Set([
     ...constructors.keys(),
+    ...constructorNamespaces.keys(),
     ...awsCommands.keys(),
     ...googleNamespaces,
     ...boto3Namespaces,
@@ -2261,6 +2625,7 @@ function importProvenance(
   }
   for (const name of shadowed) {
     constructors.delete(name);
+    constructorNamespaces.delete(name);
     awsCommands.delete(name);
     googleNamespaces.delete(name);
     boto3Namespaces.delete(name);
@@ -2272,6 +2637,7 @@ function importProvenance(
   }
   return {
     constructors,
+    constructorNamespaces,
     awsCommands,
     googleNamespaces,
     boto3Namespaces,
@@ -2282,6 +2648,29 @@ function importProvenance(
     aiSdkInstances,
     aiSdkFactories,
   };
+}
+
+/**
+ * The client binding a call chain starts from, with the chain re-rooted at the bound name
+ * so `methodRule` reads the same method tail either way. An instance attribute is bound
+ * under its two-part name (`self.client`); a class field or class-level attribute read
+ * through the instance (`this.client` for `private client = new OpenAI()`) falls back to
+ * its bare name, since that is where its construction was recorded.
+ */
+function bindingForChain(
+  bindings: ReadonlyMap<string, ClientBinding>,
+  chain: readonly string[],
+  language: "javascript" | "python",
+): { binding: ClientBinding; chain: string[] } | undefined {
+  const [head, attribute] = chain;
+  if (head === undefined) return undefined;
+  if (head === (language === "python" ? "self" : "this") && attribute !== undefined && chain.length > 2) {
+    const compound = `${head}.${attribute}`;
+    const binding = bindings.get(compound) ?? bindings.get(attribute);
+    return binding === undefined ? undefined : { binding, chain: [compound, ...chain.slice(2)] };
+  }
+  const binding = bindings.get(head);
+  return binding === undefined ? undefined : { binding, chain: [...chain] };
 }
 
 function chainBefore(tokens: readonly Token[], openIndex: number): string[] {
@@ -2582,28 +2971,56 @@ function clientBindings(
     };
   };
 
+  const instanceReceiver = language === "python" ? "self" : "this";
+  /**
+   * The name a construction assigned at `equalsIndex` binds. A bare name binds itself; an
+   * instance attribute binds as `self.client` / `this.client`, the chain later calls read
+   * it through. Any other object's attribute is not attributable to one name, so it binds
+   * nothing rather than the bare attribute name an unrelated call could also start with.
+   */
+  const assignmentTarget = (equalsIndex: number): string | undefined => {
+    if (tokens[equalsIndex]?.value !== "=") return undefined;
+    const name = tokens[equalsIndex - 1];
+    if (name?.kind !== "identifier") return undefined;
+    const separator = structuralValue(tokens[equalsIndex - 2]);
+    if (separator !== "." && separator !== "?.") return name.value;
+    const receiver = tokens[equalsIndex - 3];
+    return separator === "." &&
+        isIdentifier(receiver, instanceReceiver) &&
+        !isMemberAccessBefore(tokens, equalsIndex - 3)
+      ? `${instanceReceiver}.${name.value}`
+      : undefined;
+  };
+
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     const isNew = language === "javascript" && isIdentifier(token, "new");
     const classIndex = isNew ? index + 1 : index;
     const localClassName = tokens[classIndex]?.value;
     if (tokens[classIndex]?.kind !== "identifier" || localClassName === undefined) continue;
-    const imported = imports.constructors.get(localClassName);
-    if (imported === undefined) continue;
-    let variable: string | undefined;
-    if (isNew) {
-      if (tokens[index - 1]?.value === "=" && tokens[index - 2]?.kind === "identifier") {
-        variable = tokens[index - 2]?.value;
-      }
-    } else if (
-      language === "python" &&
-      tokens[index - 1]?.value === "=" &&
-      tokens[index - 2]?.kind === "identifier"
+    let imported = imports.constructors.get(localClassName);
+    let constructorIndex = classIndex;
+    // `import anthropic` then `anthropic.Anthropic()`: the quickstart form of the Python SDKs.
+    const namespaceModule = imports.constructorNamespaces.get(localClassName);
+    const member = tokens[classIndex + 2];
+    if (
+      imported === undefined &&
+      namespaceModule !== undefined &&
+      !isMemberAccessBefore(tokens, classIndex) &&
+      tokens[classIndex + 1]?.value === "." &&
+      member?.kind === "identifier"
     ) {
-      variable = tokens[index - 2]?.value;
+      const integration = CONSTRUCTORS_BY_MODULE[namespaceModule]?.[member.value];
+      if (integration !== undefined) {
+        imported = { integration, canonicalName: member.value };
+        constructorIndex = classIndex + 2;
+      }
     }
+    if (imported === undefined) continue;
+    if (!isNew && language === "javascript") continue;
+    const variable = assignmentTarget(index - 1);
     if (variable === undefined) continue;
-    const arguments_ = constructorArguments(tokens, classIndex);
+    const arguments_ = constructorArguments(tokens, constructorIndex);
     if (imported.integration === "openai") {
       const platform = imported.canonicalName.includes("Azure")
         ? "azure"
@@ -3133,6 +3550,22 @@ function createSemanticFact(input: {
   };
 }
 
+/**
+ * A semantic fact supersedes the lexical match for its own literal only when it can join
+ * the feed itself. An unproven endpoint — a custom gateway — leaves the platform unknown,
+ * and such a fact joins nothing, so suppressing the text match would drop an exact feed ID
+ * that plain text matching reports everywhere else.
+ */
+function supersedingLiteralSpan(
+  fact: EvidenceFact,
+  token: Token,
+  resolved: ResolvedValue,
+): SemanticLiteralSpan | undefined {
+  return fact.platformResolution === "unknown"
+    ? undefined
+    : directSemanticLiteralSpan(token, resolved);
+}
+
 function directSemanticLiteralSpan(
   token: Token,
   resolved: ResolvedValue,
@@ -3283,7 +3716,7 @@ function opensModelSelector(token: Token): boolean {
  */
 function detectAiSdkModelCalls(input: {
   tokens: readonly Token[];
-  constants: ReadonlyMap<string, string>;
+  constants: ConstantTable;
   imports: ImportProvenance;
   analysis: TokenAnalysis;
   path: string;
@@ -3385,7 +3818,7 @@ function detectAiSdkModelCalls(input: {
       anchor,
     });
     facts.push(fact);
-    const literalSpan = directSemanticLiteralSpan(valueToken, resolved);
+    const literalSpan = supersedingLiteralSpan(fact, valueToken, resolved);
     if (literalSpan !== undefined) literalSpans.push(literalSpan);
     input.recordConsumedEnvironment(fact, clientBinding, resolved);
     assertEvidenceBudget(facts.length);
@@ -3451,9 +3884,10 @@ function detectSdkCalls(
   for (let openIndex = 0; openIndex < tokens.length; openIndex += 1) {
     if (structuralValue(tokens[openIndex]) !== "(") continue;
     const chain = chainBefore(tokens, openIndex);
-    const binding = chain[0] === undefined ? undefined : bindings.get(chain[0]);
-    if (binding === undefined) continue;
-    const rule = methodRule(binding, chain);
+    const bound = bindingForChain(bindings, chain, language);
+    if (bound === undefined) continue;
+    const binding = bound.binding;
+    const rule = methodRule(binding, bound.chain);
     if (rule === null) continue;
     const closeIndex = matchingIndex(tokens, openIndex, "(", ")");
     if (closeIndex === null) continue;
@@ -3506,7 +3940,7 @@ function detectSdkCalls(
       anchor,
     });
     facts.push(fact);
-    const literalSpan = directSemanticLiteralSpan(valueToken, resolved);
+    const literalSpan = supersedingLiteralSpan(fact, valueToken, resolved);
     if (literalSpan !== undefined) literalSpans.push(literalSpan);
     recordConsumedEnvironment(fact, effectiveBinding, resolved);
     assertEvidenceBudget(facts.length);
@@ -3593,7 +4027,7 @@ function detectSdkCalls(
         anchor: canonicalCommand as string,
       });
       facts.push(fact);
-      const literalSpan = directSemanticLiteralSpan(tokens[valueIndex] as Token, resolved);
+      const literalSpan = supersedingLiteralSpan(fact, tokens[valueIndex] as Token, resolved);
       if (literalSpan !== undefined) literalSpans.push(literalSpan);
       recordConsumedEnvironment(fact, binding, resolved);
       assertEvidenceBudget(facts.length);
@@ -3766,7 +4200,39 @@ export function classifyEvidenceScope(path: string, semantic = false): EvidenceS
   }
   if (HCL_EXTENSIONS.has(extension)) return "deployment";
   if (semantic || SOURCE_EXTENSIONS.has(extension)) return "application";
-  return "unknown";
+  return configurationScope(lower, segments, fileName, extension) ?? "unknown";
+}
+
+/**
+ * Configuration is where a deployed model is most often chosen — a Helm value, a compose
+ * environment entry, an app settings file — so an exact feed ID there must warn rather than
+ * sit in the report as a notice. Only lexical fallback reads these files, and lexical
+ * evidence is never policy eligible, so this scope decides visibility, never blocking.
+ */
+function configurationScope(
+  lowerPath: string,
+  segments: readonly string[],
+  fileName: string,
+  extension: string,
+): EvidenceScope | undefined {
+  // GitHub runs every file in the workflows directory, whatever it is named.
+  if (GITHUB_WORKFLOW_PATH.test(lowerPath)) return "deployment";
+  const dotenv = DOTENV_PATH.test(fileName);
+  const deploymentFile =
+    DEPLOYMENT_FILE_NAMES.has(fileName) || DEPLOYMENT_FILE_PATTERN.test(fileName);
+  if (!dotenv && !deploymentFile && !CONFIGURATION_EXTENSIONS.has(extension)) return undefined;
+  const nameParts = fileName.split(".").slice(1);
+  if (nameParts.some((part) => CONFIGURATION_EXAMPLE_PARTS.has(part))) return "example";
+  if (dotenv && nameParts.includes("test")) return "test";
+  if (NON_SELECTING_CONFIGURATION_FILE.test(fileName)) return "unknown";
+  if (
+    dotenv ||
+    deploymentFile ||
+    segments.slice(0, -1).some((segment) => DEPLOYMENT_DIRECTORIES.has(segment))
+  ) {
+    return "deployment";
+  }
+  return "application";
 }
 
 type AutomatonNode = { transitions: Map<string, number>; failure: number; outputs: number[] };
@@ -3926,6 +4392,147 @@ function lexicalFacts(
     } else {
       column += 1;
     }
+  }
+  return facts;
+}
+
+const KEYED_LEXICAL_RULE_ID = "fallback.text.keyed-lifecycle-id@1";
+/** Longest key read leftwards from a separator, and widest gap on either side of it. */
+const MAX_KEYED_KEY_LENGTH = 128;
+const MAX_KEYED_GAP = 16;
+const KEY_CHARACTER = /^[A-Za-z0-9_-]$/;
+/** A `=` preceded by one of these is a comparison or compound operator, not an assignment. */
+const NON_ASSIGNMENT_PREFIX = new Set(["=", "!", "<", ">", ":", "+", "-", "*", "/", "%", "&", "|", "^", "~"]);
+
+/**
+ * Feed IDs too short or common to match in prose — `o1`, `tts`, `whisper` — that a key
+ * still disambiguates. Only unconflicted pairs with one active signature qualify, the same
+ * admission the lexical automaton applies to eligible IDs.
+ */
+function keyedLexicalCandidates(index: V3FeedIndex): Map<string, IndexedModelPair[]> {
+  const byId = new Map<string, IndexedModelPair[]>();
+  for (const pair of index.modelPairs) {
+    if (pair.lexicalScanEligible || pair.conflict || pair.activeLifecycles.length !== 1) continue;
+    const pairs = byId.get(pair.modelId) ?? [];
+    pairs.push(pair);
+    byId.set(pair.modelId, pairs);
+  }
+  for (const pairs of byId.values()) {
+    pairs.sort((left, right) => compareText(left.servingPlatform, right.servingPlatform));
+  }
+  return byId;
+}
+
+/** `model`, `OPENAI_MODEL`, `chat_model`, `modelName`, and `model-id` all name a model. */
+function isModelKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[_-]/g, "");
+  return normalized.endsWith("model") || normalized === "modelid" || normalized === "modelname";
+}
+
+/**
+ * Whether the value at `[start, end)` is written as the value of a model key on the same
+ * line: `model: o1`, `"model": "o1"`, `model="o1"`, `OPENAI_MODEL=o1`. An unquoted value is
+ * accepted only outside conventional source files, where a bare word would be a variable.
+ */
+function isKeyedValue(source: string, start: number, end: number, quotesRequired: boolean): boolean {
+  const before = source[start - 1];
+  const after = source[end];
+  let cursor = start;
+  if (before === '"' || before === "'" || before === "`") {
+    if (after !== before) return false;
+    cursor = start - 1;
+  } else if (quotesRequired || identifierCharacter(before) || identifierCharacter(characterAt(source, end))) {
+    return false;
+  }
+  const skipGap = (from: number): number => {
+    let index = from;
+    while (index > 0 && from - index < MAX_KEYED_GAP && (source[index - 1] === " " || source[index - 1] === "\t")) {
+      index -= 1;
+    }
+    return index;
+  };
+  cursor = skipGap(cursor);
+  const separator = source[cursor - 1];
+  if (separator !== ":" && separator !== "=") return false;
+  if (NON_ASSIGNMENT_PREFIX.has(source[cursor - 2] ?? "")) return false;
+  cursor = skipGap(cursor - 1);
+  const keyQuote = source[cursor - 1];
+  const quotedKey = keyQuote === '"' || keyQuote === "'";
+  if (quotedKey) cursor -= 1;
+  const keyEnd = cursor;
+  while (cursor > 0 && keyEnd - cursor < MAX_KEYED_KEY_LENGTH && KEY_CHARACTER.test(source[cursor - 1] ?? "")) {
+    cursor -= 1;
+  }
+  if (cursor === keyEnd || (quotedKey && source[cursor - 1] !== keyQuote)) return false;
+  return isModelKey(source.slice(cursor, keyEnd));
+}
+
+/**
+ * Keyed fallback for the IDs the lexical automaton skips. Evidence is the same low-
+ * confidence, never-eligible text match as `fallback.text.lifecycle-id@1`, under its own
+ * rule because it rests on a key rather than on the ID alone.
+ */
+function keyedLexicalFacts(
+  source: string,
+  path: string,
+  blobOid: string,
+  candidates: ReadonlyMap<string, readonly IndexedModelPair[]>,
+  semanticLiteralSpans: readonly SemanticLiteralSpan[],
+): EvidenceFact[] {
+  if (candidates.size === 0) return [];
+  const scope = classifyEvidenceScope(path);
+  const quotesRequired = SOURCE_EXTENSIONS.has(extname(path.toLowerCase()));
+  const semanticSpans = new Set(
+    semanticLiteralSpans.map((span) => JSON.stringify([span.modelId, span.startOffset, span.endOffset])),
+  );
+  const matches: Array<{ start: number; modelId: string; pairs: readonly IndexedModelPair[] }> = [];
+  for (const [modelId, pairs] of candidates) {
+    for (let start = source.indexOf(modelId); start !== -1; start = source.indexOf(modelId, start + 1)) {
+      const end = start + modelId.length;
+      if (semanticSpans.has(JSON.stringify([modelId, start, end]))) continue;
+      if (isKeyedValue(source, start, end, quotesRequired)) matches.push({ start, modelId, pairs });
+    }
+  }
+  matches.sort((left, right) => left.start - right.start || compareText(left.modelId, right.modelId));
+  const facts: EvidenceFact[] = [];
+  let line = 1;
+  let lineStart = 0;
+  let scanned = 0;
+  for (const match of matches) {
+    for (; scanned < match.start; scanned += 1) {
+      if (source[scanned] === "\n") {
+        line += 1;
+        lineStart = scanned + 1;
+      }
+    }
+    const platforms = [...new Set(match.pairs.map((pair) => pair.servingPlatform))];
+    facts.push({
+      evidenceId: makeEvidenceId(KEYED_LEXICAL_RULE_ID, path, match.modelId, match.modelId, facts.length),
+      origin: "repository",
+      kind: "lexical",
+      confidence: "low",
+      scope,
+      environment: scope === "test" ? "test" : "unknown",
+      detectorRuleId: KEYED_LEXICAL_RULE_ID,
+      detectorManifestVersion: DETECTOR_MANIFEST_VERSION,
+      rawValue: match.modelId,
+      modelId: match.modelId,
+      ...(platforms.length === 1 ? { servingPlatform: platforms[0] } : {}),
+      modelResolution: "resolved",
+      selectorKind: "model-id",
+      platformResolution: platforms.length === 1 ? "resolved" : "ambiguous",
+      policyEligible: false,
+      locations: [
+        {
+          path,
+          line,
+          column: [...source.slice(lineStart, match.start)].length + 1,
+          blobOid,
+        },
+      ],
+      resolutionTrace: [{ kind: "detector", detail: "exact typed-feed ID written as a model key's value" }],
+    });
+    assertEvidenceBudget(facts.length);
   }
   return facts;
 }
@@ -4311,8 +4918,8 @@ function unsupportedFrameworkDiagnostics(
       `${framework.displayName} (${framework.frameworkId}) is imported by ${sorted.length} tracked file(s), ` +
       `${prefix === undefined ? NO_SUPPORT_CAUSE : PARTIAL_SUPPORT_CAUSE}. Model selections made that way ` +
       "were assessed by bounded lexical fallback only, so they cannot block, are reported only as text " +
-      "matches, and produce nothing at all when the selector is dynamic or the model ID is not " +
-      "literal-scan eligible. Files: ";
+      "matches, and produce nothing at all when the selector is dynamic or the model ID is neither " +
+      "literal-scan eligible nor written as a model key's value. Files: ";
     // The sample is the only actionable part, so whole paths are dropped until it
     // fits the publisher's message cap rather than being cut mid-path by it.
     let sample = sorted.slice(0, MAX_DIAGNOSTIC_SAMPLE_PATHS);
@@ -4383,6 +4990,7 @@ function isClaimDocument(path: string): boolean {
 export function detectSnapshot(snapshot: GitTreeSnapshot, feed: V3FeedIndex): DetectionResult {
   const candidates = lexicalCandidates(feed);
   const automaton = buildAutomaton(candidates);
+  const keyedCandidates = keyedLexicalCandidates(feed);
   const evidence: EvidenceFact[] = [];
   const consumedEnvironmentSelectors: ConsumedEnvironmentSelector[] = [];
   const diagnostics: CoverageDiagnostic[] = snapshot.diagnostics
@@ -4473,7 +5081,14 @@ export function detectSnapshot(snapshot: GitTreeSnapshot, feed: V3FeedIndex): De
         automaton,
         literalSpans,
       );
-      evidence.push(...semantic, ...lexical);
+      const keyed = keyedLexicalFacts(
+        source,
+        entry.displayPath,
+        entry.objectId,
+        keyedCandidates,
+        literalSpans,
+      );
+      evidence.push(...semantic, ...lexical, ...keyed);
       assertEvidenceBudget(evidence.length);
     }
 

@@ -19,6 +19,7 @@ import {
 import type { Environment } from "../../src/action/github.ts";
 import { inspectPolicy } from "../../src/policy/policy.ts";
 import { ActionRunError, run, type RunDependencies } from "../../src/action/run.ts";
+import { deliverSlackNotification } from "../../src/action/notification.ts";
 import type { SnapshotClaimsInspection } from "../../src/evidence/snapshot-claims.ts";
 import type {
   AssessmentReport,
@@ -518,6 +519,70 @@ describe("v3 production orchestration", () => {
     );
   });
 
+  test("a PR reports the not-assessed notices for the merged tree only", async () => {
+    const bedrock = (evidenceId: string, path: string): EvidenceFact => ({
+      ...evidence(evidenceId),
+      detectorRuleId: "source.py.aws-bedrock.invoke-model@1",
+      rawValue: "anthropic.claude-3-haiku-20240307-v1:0",
+      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      servingPlatform: "aws-bedrock",
+      selectorKind: "polymorphic",
+      policyEligible: false,
+      locations: [{ path, line: 1, column: 1 }],
+    });
+    const dynamic = (evidenceId: string, path: string): EvidenceFact => {
+      const fact: EvidenceFact = {
+        ...evidence(evidenceId),
+        rawValue: "modelId",
+        modelResolution: "dynamic",
+        selectorKind: "dynamic",
+        policyEligible: false,
+        locations: [{ path, line: 1, column: 1 }],
+      };
+      delete fact.modelId;
+      return fact;
+    };
+    const fixture = fixtureEnvironment({ GITHUB_EVENT_NAME: "pull_request" });
+    const report = await run(
+      dependencies(fixture, {
+        resolveEvent: () => comparisonEvent("available"),
+        detect: (inspected) =>
+          detection(
+            inspected.treeObjectId === BASE
+              ? [bedrock("base-call", "app/bedrock.py"), dynamic("base-dynamic", "src/a.ts")]
+              : [
+                  bedrock("base-call", "app/bedrock.py"),
+                  bedrock("new-call", "src/more.ts"),
+                  dynamic("base-dynamic", "src/a.ts"),
+                  dynamic("new-dynamic", "src/b.ts"),
+                ],
+          ),
+      }),
+    );
+
+    // The base's copy would name usage the pull request may have changed or removed.
+    expect(
+      report.diagnostics
+        .filter((diagnostic) => diagnostic.code === "platform-without-lifecycle-data")
+        .map((diagnostic) => diagnostic.message),
+    ).toEqual([
+      "The lifecycle feed publishes no records for aws-bedrock (2 reference(s): app/bedrock.py, src/more.ts), so those model references were not checked for deprecation.",
+    ]);
+    expect(
+      report.diagnostics
+        .filter((diagnostic) => diagnostic.code === "selector-without-model-id")
+        .map((diagnostic) => diagnostic.message),
+    ).toEqual([
+      "2 model reference(s) in application or deployment code could not be resolved to a model ID (src/a.ts, src/b.ts), so they were not checked for deprecation.",
+    ]);
+    expect(report.scanStatus).toBe("complete");
+    expect(report.result).toBe("no-actionable-risk");
+    const summary = readFileSync(fixture.summaryPath, "utf8");
+    expect(summary.match(/^Not assessed: /gm)).toHaveLength(2);
+    expect(summary).not.toContain("platform-without-lifecycle-data");
+    expect(summary).not.toContain("selector-without-model-id");
+  });
+
   test("does not fail an unrelated PR for unchanged base debt", async () => {
     const fixture = fixtureEnvironment({ GITHUB_EVENT_NAME: "pull_request" });
     const report = await run(
@@ -939,6 +1004,37 @@ describe("v3 production orchestration", () => {
       scanStatus: "partial",
       exitReason: "partial-disallowed",
     });
+  });
+
+  test("passes slack-notify through and reports a skipped clean snapshot", async () => {
+    const fixture = fixtureEnvironment({
+      "INPUT_SLACK-WEBHOOK": "https://hooks.slack.test/services/test",
+      "INPUT_SLACK-NOTIFY": "findings",
+    });
+    let requested: string | undefined;
+    const report = await run(
+      dependencies(fixture, {
+        deliverNotification: async (options) => {
+          requested = options.notify;
+          return deliverSlackNotification({
+            ...options,
+            fetchImpl: async () => {
+              throw new Error("a clean run must not post");
+            },
+          });
+        },
+      }),
+    );
+
+    expect(requested).toBe("findings");
+    expect(report).toMatchObject({
+      result: "no-actionable-risk",
+      notificationStatus: "skipped",
+      notificationReason:
+        "No blocking or advisory finding and coverage is complete; slack-notify is `findings`.",
+      exitReason: "none",
+    });
+    expect(outputs(fixture.outputPath)["notification-status"]).toBe("skipped");
   });
 
   test("attempts notification only after core publication and keeps health independent", async () => {

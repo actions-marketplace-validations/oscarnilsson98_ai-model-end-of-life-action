@@ -37,6 +37,7 @@ source.py.anthropic.messages-model@1
 binding.github-actions.consumed-model@1
 deploy.hcl.azure.cognitive-deployment-model@1
 fallback.text.lifecycle-id@1
+fallback.text.keyed-lifecycle-id@1
 ```
 
 Changing a rule's evidence meaning, resolution authority, confidence, scope/environment behavior, or policy eligibility requires a new rule major. Adding a new API family requires a new rule ID. A fixture-preserving parser crash/location fix or an additional syntax spelling with identical semantics may keep the rule major, but changes the versioned detector-manifest revision and digest. The release publishes the complete detector/rule manifest; every run publishes its digest.
@@ -132,15 +133,18 @@ The launch matrix is intentionally bounded. “Policy eligible” below is rule 
 | `deploy.hcl.azure.cognitive-deployment-model@1` | HCL/Terraform | `azurerm_cognitive_deployment` with direct static `model.format`, `model.name`, and optional `model.version` strings | Resource establishes `azure`; the tuple remains a deployment/model tuple until a versioned trusted resolution maps it to one exact feed ID. Omitted version and auto-upgrade remain unresolved; dynamic values and unsupported forms are outside this semantic rule and receive lexical fallback only | Only after exact trusted tuple resolution |
 | `binding.env.consumed-model@1`, `binding.github-actions.consumed-model@1` | Dotenv/GitHub workflow YAML | Literal value linked by exact variable name to a supported semantic selector | Inherits candidates from the consuming fact and never resolves independently | Never independently |
 | `fallback.text.lifecycle-id@1` | Other bounded UTF-8 text | Boundary-safe exact ID from a record with `literalScanEligible: true` | Feed candidates only; never inferred | No |
+| `fallback.text.keyed-lifecycle-id@1` | Any bounded UTF-8 text | An exact ID from an unconflicted record with `literalScanEligible: false`, written on one line as the value of a key whose name, lower-cased without `_` and `-`, ends in `model` or is `modelid`/`modelname` — `model: o1`, `"chat_model": "o1"`, `model="o1"`, `OPENAI_MODEL=o1`. The value must be quoted in conventional source files; a `=` that is part of a comparison or compound operator does not qualify. A literal a platform-joining semantic fact already reported is not repeated | Feed candidates only; never inferred | No |
+
+Both official SDK rules in Python and TypeScript recognize a client however the quickstart or a class wrapper binds it: a named or default import (`from openai import OpenAI`), a Python module import (`import anthropic` then `anthropic.Anthropic()`, with or without `as`), an instance attribute (`self.client = …`, `this.client = new …`), and a class field or class-level attribute read through the instance (`this.client` for `private client = new Anthropic()`). An attribute of any other object (`config.client = …`) binds nothing, since a later bare `client` call cannot be attributed to it; a name reassigned in the file loses its binding as before.
 
 Support is syntax-based because the action does not install repository dependencies. `src/detection/manifest.ts` pins the exact SDK/package versions used to qualify every row and includes them in the detector-manifest digest; later SDK syntax is unsupported until fixtures and the detector-manifest revision are updated.
 
 | Ecosystem | Qualified package | Qualified version |
 | --- | --- | --- |
 | npm | `openai` | `7.4.0` |
-| PyPI | `openai` | `2.46.0` |
+| PyPI | `openai` | `3.19.2` |
 | npm | `@anthropic-ai/sdk` | `0.112.4` |
-| PyPI | `anthropic` | `0.117.0` |
+| PyPI | `anthropic` | `1.8.0` |
 | npm | `@google/genai` | `2.13.0` |
 | PyPI | `google-genai` | `2.13.0` |
 | npm | `@aws-sdk/client-bedrock-runtime` | `3.1096.0` |
@@ -155,7 +159,7 @@ Support is syntax-based because the action does not install repository dependenc
 | npm | `@ai-sdk/amazon-bedrock` | `5.0.40` |
 | npm | `@ai-sdk/cohere` | `4.0.20` |
 | npm | `@ai-sdk/groq` | `4.0.21` |
-| npm | `@ai-sdk/xai` | `4.0.27` |
+| npm | `@ai-sdk/xai` | `5.0.7` |
 
 V3.0 does not claim semantic support for Go, Java, Kotlin, C#, Ruby, PHP, LiteLLM, legacy `@google/generative-ai`, the retired Vertex AI generative SDK module, platform-specific Anthropic clients, arbitrary framework wrappers, broad Kubernetes/Helm schemas, generic Terraform resources, or arbitrary keys named `model`. Those files still receive bounded lexical fallback where eligible. These higher-ambiguity integrations may ship in v3.x only with separate provider-specific rule IDs and fixtures; they are not stretched into v3.0 by generic matching.
 
@@ -176,13 +180,15 @@ Primary qualification references are the official [OpenAI Node](https://github.c
 V3.0 semantic rules may resolve:
 
 - direct static string literals, including template literals with no substitutions;
-- unique, unshadowed, top-level same-file immutable string constants;
+- unique, unshadowed same-file immutable string constants, at any block depth;
+- literal dotted paths into unique, unshadowed same-file object literals (`MODELS.flash.id`), where the literal contains no spread, computed key, repeated key, or key containing `.`, and the path uses plain `.` access rather than a computed index, a call, or optional chaining. Only keys a `.` chain can reach are recorded; a key such as `"gpt-4o"` is skipped without affecting its siblings;
 - direct supported environment references and their static string fallbacks;
+- the static default of a runtime selector written as `a ?? b`, `a || b`, or Python `a or b`, where the left side is a simple value and the right side resolves statically. The default is reported as the model with `selectorKind: "dynamic"`, because the caller may still supply anything: it is never policy-eligible and can never block. When the left side itself resolves to a non-empty string the operator cannot fire, so that value is the model and keeps its ordinary definite standing;
 - direct client bindings constructed from supported imported SDK classes;
 - exact-name environment bindings consumed by a supported semantic fact;
 - static Azure Terraform model tuples, which remain unresolved until an exact trusted tuple resolution exists.
 
-V3.0 does not resolve object-property indirection, string concatenation, template substitutions, local factories, broad cross-file or interprocedural dataflow, arbitrary code evaluation, package execution, remote lookup, source-map reconstruction, or reachability. An unresolved selector remains first-class high/medium/low evidence with model/platform resolution states; it is not guessed.
+V3.0 does not resolve string concatenation, template substitutions, local factories, broad cross-file or interprocedural dataflow, arbitrary code evaluation, package execution, remote lookup, source-map reconstruction, or reachability. Object-property indirection is resolved only in the same-file literal form described above; a computed index such as `MODELS[provider].id` needs a narrowed type this pass does not have, and an object imported from another module is outside the per-blob analysis. A constant initializer is resolved against object literals but not against other constants, so a two-hop `const a = MODELS.flash; const b = a.id;` stays unresolved. A `const` carrying an explicit type annotation is not read, because the annotation may itself contain the `=` the scan looks for. An unresolved selector remains first-class high/medium/low evidence with model/platform resolution states; it is not guessed.
 
 Exact-name environment linking is scope-aware. Conflicting values from production, staging, tests, or several deployment files remain separate candidates with their provenance; file order or an undocumented precedence rule never selects one.
 
@@ -215,6 +221,8 @@ Evidence scope is independent of syntax:
 
 Comments and arbitrary strings are excluded from semantic evidence by parsers. Exact feed IDs there remain low-confidence lexical evidence: documentation/test/fixture/example/generated/unknown scopes are notices, while application/deployment scope may become advisory inside the warning horizon under the product contract. Lexical evidence is never policy eligible.
 
+A semantic fact supersedes the lexical match for its own literal, so one call site yields one fact. The exception is a fact whose endpoint leaves the platform unknown, such as a custom gateway: it joins no feed record, so the lexical match for the same literal is kept and reports the exact feed ID as a text match, as it would anywhere else.
+
 Generated-only evidence remains visible. Duplication alone cannot raise confidence or establish production.
 
 V3.0 conventional path matching is ASCII-case-insensitive, segment-aware, and applies segment/filename rules in this order:
@@ -223,9 +231,17 @@ V3.0 conventional path matching is ASCII-case-insensitive, segment-aware, and ap
 2. `test`, `tests`, `__tests__`, `spec`, `fixtures`, and files with `.test.*`/`.spec.*` are `test`;
 3. `example`, `examples`, `demo`, `demos`, `sample`, and `samples` are `example`;
 4. `dist`, `build`, `generated`, `out`, `archive`, `archived`, `legacy`, `vendor`, and recognized bundles are generated/uncertain artifacts and begin as `unknown`;
-5. recognized IaC and deployment schemas outside the higher-precedence noise scopes are `deployment`;
+5. recognized IaC (`.tf` and `.hcl`) outside the higher-precedence noise scopes is `deployment`;
 6. a parser-recognized SDK call or a tracked conventional source file outside those scopes is `application` with environment `unknown`; v3.0 conventional extensions are `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts`, `.py`, `.go`, `.java`, `.kt`, `.kts`, `.cs`, `.rb`, `.php`, `.rs`, `.swift`, `.c`, `.h`, `.cc`, `.cpp`, and `.sh`;
-7. other evidence is `unknown`.
+7. configuration is classified by name, in this order:
+   - every file under `.github/workflows/` is `deployment`, because GitHub runs it whatever it is named;
+   - a configuration, dotenv, or deployment file whose name carries an `example`, `sample`, `template`, or `dist` part after the first (`.env.example`, `config.sample.yaml`) is `example`, and a dotenv file with a `test` part is `test`;
+   - `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, and `openapi*`/`swagger*` JSON or YAML documents enumerate model IDs without selecting one and are `unknown`;
+   - dotenv files, deployment descriptors (`Dockerfile`, `Containerfile`, `*.dockerfile`, `compose*.yml`, `docker-compose*.yml`, `values*.yaml`, `helmfile*.yaml`, `Chart.yaml`, `kustomization.yaml`, `skaffold.yaml`, `serverless.yml`, `Procfile`, `fly.toml`, `render.yaml`, `*.tfvars`, `*.tfvars.json`, `*.tf.json`, and `*.bicep`), and configuration files inside a `k8s`, `kubernetes`, `kube`, `helm`, `charts`, `manifests`, `kustomize`, `deploy`, `deployment`, `deployments`, `infra`, or `infrastructure` directory are `deployment`;
+   - other configuration files — `.yaml`, `.yml`, `.json`, `.jsonc`, `.json5`, `.toml`, `.ini`, `.cfg`, `.conf`, `.properties`, and `.env` — are `application`, since an application reads its settings from them;
+8. other evidence is `unknown`.
+
+No semantic rule reads configuration files, so rule 7 reaches only `fallback.text.lifecycle-id@1` evidence: it decides whether an exact feed ID in configuration warns or stays a notice, and never grants blocking authority, because lexical evidence is never policy eligible. The environment-binding rules keep taking their scope from the consuming call site. Because rule 7 changes visibility only, it shipped as a detector-manifest revision under the existing rule major rather than a new one, which would have invalidated every suppression and scope rule written against `fallback.text.lifecycle-id@1`.
 
 Path names containing `prod` or `production` never establish an environment by themselves.
 
@@ -289,7 +305,7 @@ All objects reject unknown fields. Strings, arrays, URLs, IDs, and documents hav
 
 `recordKind` is the sole semantic distinction between models and non-model entities. Records such as reusable prompts, agent builders, APIs, SDKs, tools, and products use a non-model branch and never enter semantic model joins or the lexical model automaton. An unrecognized or missing `recordKind` is a feed-contract failure; it is not silently treated as a model or ignored.
 
-`literalScanEligible` explicitly controls inclusion in the lexical fallback automaton. It is set by the typed producer or a versioned reviewed adapter based on record semantics and collision fixtures, never derived solely from identifier shape. A `false` model record remains eligible for semantic exact joins.
+`literalScanEligible` explicitly controls inclusion in the lexical fallback automaton. It is set by the typed producer or a versioned reviewed adapter based on record semantics and collision fixtures, never derived solely from identifier shape. A `false` model record remains eligible for semantic exact joins, and for `fallback.text.keyed-lifecycle-id@1`, where a key disambiguates what prose cannot.
 
 Record identity and conflict behavior are deterministic:
 

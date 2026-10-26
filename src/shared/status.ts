@@ -140,6 +140,67 @@ export function deprecationLeadsHorizon(
   );
 }
 
+/** Code of the notice naming serving platforms the lifecycle feed publishes nothing for. */
+export const UNCOVERED_PLATFORM_DIAGNOSTIC = "platform-without-lifecycle-data";
+/** Code of the notice naming typed call sites whose model no evidence could name. */
+export const UNRESOLVED_SELECTOR_DIAGNOSTIC = "selector-without-model-id";
+/**
+ * Notices that say what a run could not check. The job summary states each once as a
+ * `Not assessed:` line, and a comparison reports only the target's copy.
+ */
+export const NOT_ASSESSED_DIAGNOSTICS: ReadonlySet<string> = new Set([
+  UNCOVERED_PLATFORM_DIAGNOSTIC,
+  UNRESOLVED_SELECTOR_DIAGNOSTIC,
+]);
+
+function hasShutDown(finding: Pick<LifecycleFinding, "daysUntilShutdown">): boolean {
+  return finding.daysUntilShutdown !== null && finding.daysUntilShutdown < 0;
+}
+
+/**
+ * Human-facing surfaces lead with the shutdown, because that is the day calls start
+ * failing, and say plainly when it has already passed.
+ */
+export function shutdownText(
+  finding: Pick<LifecycleFinding, "shutdownDate" | "daysUntilShutdown">,
+): string {
+  const { shutdownDate: date, daysUntilShutdown: days } = finding;
+  if (date === undefined) return "shutdown date not announced";
+  if (days === null || !Number.isSafeInteger(days)) return `shutdown ${date}`;
+  if (days < 0) return `shut down ${date} (${-days}d ago)`;
+  if (days === 0) return `shuts down today (${date})`;
+  return `shutdown ${date} (in ${days}d)`;
+}
+
+/**
+ * The deprecation, when it is the date that opened the warning horizon, so a warning
+ * against a distant shutdown still says why it fired. Omitted once the model has shut down.
+ */
+export function deprecationText(
+  finding: Pick<
+    LifecycleFinding,
+    "deprecationDate" | "daysUntilShutdown" | "daysUntilDeprecation"
+  >,
+): string | null {
+  const date = finding.deprecationDate;
+  if (date === undefined || !deprecationLeadsHorizon(finding) || hasShutDown(finding)) {
+    return null;
+  }
+  const days = finding.daysUntilDeprecation;
+  if (days === undefined || !Number.isSafeInteger(days)) return `deprecation ${date}`;
+  if (days < 0) return `deprecated ${date} (${-days}d ago)`;
+  if (days === 0) return `deprecated today (${date})`;
+  return `deprecation ${date} (in ${days}d)`;
+}
+
+/**
+ * Shutdown order for human-facing lists: models already shut down first, then the nearest
+ * shutdown, then records with no published shutdown date.
+ */
+export function shutdownOrderDays(finding: Pick<LifecycleFinding, "daysUntilShutdown">): number {
+  return finding.daysUntilShutdown ?? Number.MAX_SAFE_INTEGER;
+}
+
 export function resultFromFindings(
   findings: readonly Pick<LifecycleFinding, "outcome">[],
 ): Exclude<Result, "unknown"> {
@@ -198,6 +259,24 @@ const SCOPES: readonly EvidenceScope[] = [
   "unknown",
 ];
 const RESOLUTIONS: readonly ModelResolution[] = ["resolved", "dynamic", "unresolved"];
+
+/**
+ * Whether an unresolved selector is worth a reader's attention: a typed call site in code
+ * that runs, rather than a text match or a low-confidence guess. This never elevates the
+ * result. A selector computed at runtime can be unresolvable by construction — a caller-
+ * supplied override has no static value to find — so elevating would pin the repository to
+ * a standing advisory that no change can clear. It selects which references human-facing
+ * surfaces name.
+ */
+export function isPolicyRelevantUnresolved(
+  fact: Pick<EvidenceFact, "kind" | "confidence" | "scope">,
+): boolean {
+  return (
+    fact.kind !== "lexical" &&
+    fact.confidence !== "low" &&
+    (fact.scope === "application" || fact.scope === "deployment")
+  );
+}
 
 export function buildCounts(
   evidence: readonly EvidenceFact[],

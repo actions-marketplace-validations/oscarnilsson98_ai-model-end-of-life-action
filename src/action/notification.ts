@@ -4,12 +4,13 @@ import {
   type FetchLike,
 } from "../shared/http.ts";
 import { parseHttpsUrl } from "./input.ts";
-import { deprecationLeadsHorizon, earliestLifecycleDays } from "../shared/status.ts";
+import { deprecationText, shutdownOrderDays, shutdownText } from "../shared/status.ts";
 import { servingPlatformLabel } from "../shared/text.ts";
 import type {
   AssessmentReport,
   LifecycleFinding,
   NotificationStatus,
+  SlackNotifyMode,
 } from "../shared/types.ts";
 
 const MAX_SLACK_TEXT_BYTES = 12_000;
@@ -121,9 +122,8 @@ function partitionFindings(report: AssessmentReport): {
       // Verified evidence outranks a bare text match so the bounded view never buries it.
       const tierDifference = Number(isTextMatch(left)) - Number(isTextMatch(right));
       if (tierDifference !== 0) return tierDifference;
-      const leftDays = earliestLifecycleDays(left) ?? Number.POSITIVE_INFINITY;
-      const rightDays = earliestLifecycleDays(right) ?? Number.POSITIVE_INFINITY;
-      if (leftDays !== rightDays) return leftDays - rightDays;
+      const dayDifference = shutdownOrderDays(left) - shutdownOrderDays(right);
+      if (dayDifference !== 0) return dayDifference;
       const platformDifference = compareText(left.servingPlatform, right.servingPlatform);
       return platformDifference !== 0
         ? platformDifference
@@ -133,20 +133,6 @@ function partitionFindings(report: AssessmentReport): {
     listed,
     withheld: notifiable.filter((finding) => PROTECTED_SCOPES.has(finding.scope)),
   };
-}
-
-function dateText(label: string, date: string, days: number | null | undefined): string {
-  if (days === null || days === undefined || !Number.isSafeInteger(days)) {
-    return `${label} ${date}`;
-  }
-  if (days < 0) return `${label} ${date} (${Math.abs(days)}d overdue)`;
-  if (days === 0) return `${label} ${date} (today)`;
-  return `${label} ${date} (${days}d)`;
-}
-
-function deadlineText(finding: LifecycleFinding): string {
-  if (finding.shutdownDate === undefined) return "shutdown date not announced";
-  return dateText("shutdown", finding.shutdownDate, finding.daysUntilShutdown);
 }
 
 /** Report-owned URLs become links only when they cannot alter the surrounding mrkdwn. */
@@ -185,15 +171,11 @@ function findingLabel(finding: NotifiableFinding): string {
 }
 
 function findingLine(finding: NotifiableFinding): string {
-  const qualifiers: string[] = [];
-  // Name the deprecation whenever it is the nearer date, so an advisory driven by a
+  const qualifiers = [shutdownText(finding)];
+  // Name the deprecation whenever it opened the horizon, so an advisory driven by a
   // deprecation is not read as a false alarm against a distant shutdown.
-  if (deprecationLeadsHorizon(finding) && finding.deprecationDate !== undefined) {
-    qualifiers.push(
-      dateText("deprecation", finding.deprecationDate, finding.daysUntilDeprecation),
-    );
-  }
-  qualifiers.push(deadlineText(finding));
+  const deprecation = deprecationText(finding);
+  if (deprecation !== null) qualifiers.push(deprecation);
   if (finding.delta !== undefined && finding.delta !== "unchanged") {
     qualifiers.push(finding.delta);
   }
@@ -310,12 +292,29 @@ function safeFailureDetail(error: unknown): string {
 }
 
 /**
+ * Whether a snapshot carries anything to act on. A failed or partial scan counts: during a
+ * feed outage a quiet channel would read exactly like an all-clear, which is the failure
+ * this action exists to prevent. Only a clean, fully assessed, current run is quiet.
+ */
+export function snapshotHasFindings(
+  report: Pick<AssessmentReport, "result" | "scanStatus" | "evidenceHealth">,
+): boolean {
+  return (
+    report.result !== "no-actionable-risk" ||
+    report.scanStatus !== "complete" ||
+    report.evidenceHealth !== "current"
+  );
+}
+
+/**
  * Deliver one stateless Slack snapshot. PR, merge-group, and local events never consume the
- * webhook. Delivery status remains independent from lifecycle result and scan health.
+ * webhook. With `notify: "findings"` a clean snapshot is skipped rather than sent. Delivery
+ * status remains independent from lifecycle result and scan health.
  */
 export async function deliverSlackNotification(options: {
   webhookUrl: string;
   report: AssessmentReport;
+  notify?: SlackNotifyMode;
   fetchImpl?: FetchLike;
 }): Promise<SlackDeliveryResult> {
   if (
@@ -328,6 +327,13 @@ export async function deliverSlackNotification(options: {
         options.report.event.eventName,
         80,
       )} events.`,
+    };
+  }
+
+  if (options.notify === "findings" && !snapshotHasFindings(options.report)) {
+    return {
+      status: "skipped",
+      detail: "No blocking or advisory finding and coverage is complete; slack-notify is `findings`.",
     };
   }
 

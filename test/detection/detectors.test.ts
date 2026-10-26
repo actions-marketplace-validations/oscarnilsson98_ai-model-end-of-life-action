@@ -165,7 +165,7 @@ describe("v3 detectors", () => {
 
   /**
    * Every chain `methodRule` accepts, in the syntax qualified against openai 7.4.0 (npm)
-   * and 2.46.0 (PyPI). Most of these had no test at all, so a provider reshaping one of
+   * and 3.19.2 (PyPI). Most of these had no test at all, so a provider reshaping one of
    * them degraded detection to the lexical fallback — lower confidence, unable to block —
    * while coverage still reported `complete` and nothing failed. These lock the accepted
    * set so the next major bump is a test run rather than a manual read of the type surface.
@@ -230,6 +230,16 @@ describe("v3 detectors", () => {
         "audio.transcriptions.create",
         `client.audio.transcriptions.create(model="gpt-old", file=handle)`,
       ],
+      ["responses.stream", `client.responses.stream(model="gpt-old", input="hi")`],
+      [
+        "chat.completions.stream",
+        `client.chat.completions.stream(model="gpt-old", messages=[])`,
+      ],
+      ["images.edit", `client.images.edit(model="gpt-old", image=handle, prompt="hi")`],
+      [
+        "audio.translations.create",
+        `client.audio.translations.create(model="gpt-old", file=handle)`,
+      ],
     ];
 
     for (const [chain, call] of python) {
@@ -250,6 +260,38 @@ describe("v3 detectors", () => {
         expect(result.evidence.filter((fact) => fact.modelId === "gpt-old")).toHaveLength(1);
       });
     }
+
+    test("resolves the async Python client and keeps both Azure Python clients deployment-scoped", () => {
+      // openai 3.19.2 still exports all four clients with the same constructors.
+      const asyncClient = detectSnapshot(
+        snapshot(
+          "src/chat.py",
+          `from openai import AsyncOpenAI\nclient = AsyncOpenAI()\nawait client.chat.completions.create(model="gpt-old", messages=[])\n`,
+        ),
+        feed,
+      );
+      expect(asyncClient.evidence.find((fact) => fact.kind === "sdk-argument")).toMatchObject({
+        detectorRuleId: "source.py.openai.request-model@1",
+        servingPlatform: "openai",
+        selectorKind: "model-id",
+        policyEligible: true,
+      });
+      for (const constructor of ["AzureOpenAI", "AsyncAzureOpenAI"]) {
+        const azure = detectSnapshot(
+          snapshot(
+            "src/chat.py",
+            `from openai import ${constructor}\nclient = ${constructor}(azure_endpoint="https://example.openai.azure.com")\nclient.chat.completions.create(model="gpt-old", messages=[])\n`,
+          ),
+          feed,
+        );
+        expect(azure.evidence.find((fact) => fact.kind === "sdk-argument"), constructor).toMatchObject({
+          detectorRuleId: "source.py.openai.request-model@1",
+          servingPlatform: "azure",
+          selectorKind: "deployment-name",
+          policyEligible: false,
+        });
+      }
+    });
 
     test("distinguishes the Azure constructor's deployment name from an OpenAI model ID", () => {
       // AzureOpenAI still extends OpenAI and is still exported from "openai" in v7. Its
@@ -283,6 +325,29 @@ describe("v3 detectors", () => {
         policyEligible: true,
       });
     });
+  });
+
+  test("keeps the lexical match when a custom endpoint leaves the platform unknown", () => {
+    // Such a fact joins no feed record, so suppressing the text match for its literal would
+    // report nothing at all for an exact feed ID written in a gateway call.
+    for (const [path, source] of [
+      [
+        "src/chat.ts",
+        `import OpenAI from "openai";\nconst client = new OpenAI({ baseURL: "https://gateway.example" });\nawait client.chat.completions.create({ model: "gpt-old", messages: [] });\n`,
+      ],
+      [
+        "src/chat.py",
+        `from openai import OpenAI\nclient = OpenAI(base_url="https://gateway.example")\nclient.chat.completions.create(model="gpt-old", messages=[])\n`,
+      ],
+    ] as const) {
+      const evidence = detectSnapshot(snapshot(path, source), feed).evidence;
+      expect(evidence.map((fact) => [fact.kind, fact.platformResolution]), path).toEqual(
+        expect.arrayContaining([
+          ["sdk-argument", "unknown"],
+          ["lexical", "resolved"],
+        ]),
+      );
+    }
   });
 
   test("deduplicates lexical fallback evidence by the exact semantic literal span", () => {
@@ -1052,6 +1117,26 @@ describe("v3 Vercel AI SDK provider rules", () => {
     }
   });
 
+  test("reads the @ai-sdk/xai 5 provider surface", () => {
+    // Qualified against @ai-sdk/xai 5.0.7, which removed the `chat` factory: the default
+    // call, `responses`, and `languageModel` all select a language model, and a
+    // `createXai()` instance without a custom endpoint still names xAI.
+    for (const source of [
+      `import { xai } from "@ai-sdk/xai";\nawait xai.responses("gpt-old");\n`,
+      `import { xai } from "@ai-sdk/xai";\nawait xai.languageModel("gpt-old");\n`,
+      `import { xai } from "@ai-sdk/xai";\nawait xai.imageModel("gpt-old");\n`,
+      `import { createXai } from "@ai-sdk/xai";\nconst provider = createXai({ apiKey: key });\nawait provider.responses("gpt-old");\n`,
+    ]) {
+      expect(providerFact(source), source).toMatchObject({
+        detectorRuleId: "source.ts.vercel-ai-sdk.xai-model@1",
+        modelId: "gpt-old",
+        servingPlatform: "xai",
+        platformResolution: "resolved",
+        policyEligible: true,
+      });
+    }
+  });
+
   test("anchors on the provider call rather than the surrounding ai function", () => {
     // The provider call constructs the model specification, so it is evidence
     // wherever the result is used.
@@ -1634,6 +1719,228 @@ function ruleEvidence(path: string, source: string, ruleId: string) {
   );
 }
 
+describe("same-file value resolution", () => {
+  const providerFact = (source: string) =>
+    detectSnapshot(snapshot("src/model.ts", source), feed).evidence.find((fact) =>
+      fact.detectorRuleId.startsWith("source.ts.vercel-ai-sdk."),
+    );
+  const withProvider = (body: string) =>
+    `import { google } from "@ai-sdk/google";\n${body}`;
+
+  test("resolves a dotted path into a same-file object literal", () => {
+    const fact = providerFact(
+      withProvider(
+        `const MODELS = { flash: { id: "gpt-old" }, pro: { id: "other" } };\nexport const model = google(MODELS.flash.id);\n`,
+      ),
+    );
+
+    expect(fact).toMatchObject({
+      modelId: "gpt-old",
+      modelResolution: "resolved",
+      selectorKind: "model-id",
+      // A definite static value, so it carries the same weight as a direct literal.
+      policyEligible: true,
+      rawValue: "MODELS.flash.id",
+    });
+    expect(fact?.resolutionTrace).toContainEqual({
+      kind: "constant",
+      detail: "same-file object path MODELS.flash.id",
+    });
+  });
+
+  test("resolves a constant declared inside a function body", () => {
+    expect(
+      providerFact(
+        withProvider(
+          `export function build() {\n  const modelId = "gpt-old";\n  return google(modelId);\n}\n`,
+        ),
+      ),
+    ).toMatchObject({
+      modelId: "gpt-old",
+      modelResolution: "resolved",
+      selectorKind: "model-id",
+      policyEligible: true,
+    });
+  });
+
+  test("resolves a static default behind a non-environment runtime selector", () => {
+    const fact = providerFact(
+      withProvider(
+        `export function build(modelOverride) {\n  return google(modelOverride ?? "gpt-old");\n}\n`,
+      ),
+    );
+
+    expect(fact).toMatchObject({
+      modelId: "gpt-old",
+      modelResolution: "resolved",
+      // The caller may still pass anything, so the default is reported but never enforced.
+      selectorKind: "dynamic",
+      policyEligible: false,
+    });
+    expect(fact?.resolutionTrace).toContainEqual({
+      kind: "detector",
+      detail: "static default behind a runtime selector",
+    });
+  });
+
+  test("resolves an override-or-registry selector held in a function-scope constant", () => {
+    // The shape this work exists for: a registry object, a caller override, and a local
+    // constant joining them — three indirections that used to leave the call unresolved.
+    const fact = providerFact(
+      withProvider(
+        `const MODELS = { flash: { id: "gpt-old" } };\nexport function build(modelOverride) {\n  const modelId = modelOverride ?? MODELS.flash.id;\n  return google(modelId);\n}\n`,
+      ),
+    );
+
+    expect(fact).toMatchObject({
+      modelId: "gpt-old",
+      modelResolution: "resolved",
+      selectorKind: "dynamic",
+      policyEligible: false,
+    });
+  });
+
+  test("keeps an object literal unresolved when its shape is not fully known", () => {
+    const unknowable = [
+      // A spread can overwrite a recorded key, depending on where it appears.
+      `const MODELS = { ...base, flash: { id: "gpt-old" } };`,
+      // A computed key can collide with a recorded key.
+      `const MODELS = { [key]: 1, flash: { id: "gpt-old" } };`,
+      // A repeated key means the last write wins, which this pass does not model.
+      `const MODELS = { flash: { id: "gpt-old" }, flash: { id: "other" } };`,
+    ];
+    for (const declaration of unknowable) {
+      expect(
+        providerFact(withProvider(`${declaration}\nexport const m = google(MODELS.flash.id);\n`)),
+      ).toMatchObject({ modelResolution: "dynamic", policyEligible: false });
+    }
+  });
+
+  test("keeps a selector unresolved when the path is not a literal member chain", () => {
+    const unresolvable = [
+      // A computed index needs a value this pass does not have.
+      `export const m = google(MODELS[key].id);`,
+      // A call result is not a member chain.
+      `export const m = google(loadConfig().id);`,
+      // Optional chaining is not the plain `.` chain the resolver accepts.
+      `export const m = google(MODELS.flash?.id);`,
+    ];
+    for (const call of unresolvable) {
+      expect(
+        providerFact(
+          withProvider(`const MODELS = { flash: { id: "gpt-old" } };\n${call}\n`),
+        ),
+      ).toMatchObject({ modelResolution: "dynamic", policyEligible: false });
+    }
+  });
+
+  test("never lets a dotted key impersonate a nested path", () => {
+    // `MODELS.flash.id` is a real nested path and also spells the quoted key. Recording
+    // both would make declaration order decide which model the scanner reports.
+    for (const declaration of [
+      `const MODELS = { flash: { id: "gpt-old" }, "flash.id": "wrong-model" };`,
+      `const MODELS = { "flash.id": "wrong-model", flash: { id: "gpt-old" } };`,
+    ]) {
+      const fact = providerFact(
+        withProvider(`${declaration}\nexport const m = google(MODELS.flash.id);\n`),
+      );
+      expect(fact).toMatchObject({ modelResolution: "dynamic", policyEligible: false });
+      expect(fact?.modelId).toBeUndefined();
+    }
+  });
+
+  test("prefers a resolvable left operand over the fallback", () => {
+    // `??` fires only for null or undefined and `||` only for a falsy value, so a known
+    // string on the left means the default is never the model this call selects.
+    expect(
+      providerFact(
+        withProvider(
+          `const MODELS = { flash: { id: "gpt-old" } };\nexport const m = google(MODELS.flash.id ?? "wrong-model");\n`,
+        ),
+      ),
+    ).toMatchObject({
+      modelId: "gpt-old",
+      modelResolution: "resolved",
+      selectorKind: "model-id",
+      policyEligible: true,
+    });
+
+    expect(
+      providerFact(
+        withProvider(
+          `const PRIMARY = "gpt-old";\nexport const m = google(PRIMARY || "wrong-model");\n`,
+        ),
+      ),
+    ).toMatchObject({ modelId: "gpt-old", modelResolution: "resolved" });
+  });
+
+  test("resolves a Python static default behind a non-environment selector", () => {
+    expect(
+      ruleEvidence(
+        "src/chat.py",
+        `from openai import OpenAI\nclient = OpenAI()\n\n\ndef build(override):\n    return client.responses.create(model=override or "gpt-old", input="hi")\n`,
+        "source.py.openai.request-model@1",
+      ),
+    ).toMatchObject({
+      modelId: "gpt-old",
+      modelResolution: "resolved",
+      selectorKind: "dynamic",
+      policyEligible: false,
+    });
+  });
+
+  test("keys unreachable by dot access are skipped without losing the rest", () => {
+    // A dashed key can only be read with a computed index, so it is not recorded — but it
+    // must not poison the sibling paths that are reachable.
+    expect(
+      providerFact(
+        withProvider(
+          `const MODELS = { "gpt-4o": { id: "other" }, flash: { id: "gpt-old" } };\nexport const m = google(MODELS.flash.id);\n`,
+        ),
+      ),
+    ).toMatchObject({ modelId: "gpt-old", modelResolution: "resolved" });
+  });
+
+  test("pins the documented limits of same-file resolution", () => {
+    // Two hops: a constant initializer resolves against object literals, never against
+    // another constant, because chaining would depend on declaration order.
+    expect(
+      providerFact(
+        withProvider(
+          `const MODELS = { flash: { id: "gpt-old" } };\nconst chosen = MODELS.flash;\nexport const m = google(chosen.id);\n`,
+        ),
+      ),
+    ).toMatchObject({ modelResolution: "dynamic", policyEligible: false });
+
+    // An explicit type annotation puts a `:` where the scan expects `=`.
+    expect(
+      providerFact(
+        withProvider(`const modelId: string = "gpt-old";\nexport const m = google(modelId);\n`),
+      ),
+    ).toMatchObject({ modelResolution: "dynamic", policyEligible: false });
+  });
+
+  test("keeps a rebound or shadowed name unresolved", () => {
+    // Two declarations of one name: neither value is the value at the call site.
+    expect(
+      providerFact(
+        withProvider(
+          `function a() { const modelId = "gpt-old"; return modelId; }\nfunction b() { const modelId = "other"; return modelId; }\nexport const m = google(modelId);\n`,
+        ),
+      ),
+    ).toMatchObject({ modelResolution: "dynamic", policyEligible: false });
+
+    // A parameter of the same name shadows the constant wherever it is in scope.
+    expect(
+      providerFact(
+        withProvider(
+          `const MODELS = { flash: { id: "gpt-old" } };\nexport function build(MODELS) {\n  return google(MODELS.flash.id);\n}\n`,
+        ),
+      ),
+    ).toMatchObject({ modelResolution: "dynamic", policyEligible: false });
+  });
+});
+
 describe("v3 semantic support matrix golden cases", () => {
   test("recognizes representative official OpenAI JavaScript and Python methods", () => {
     const javascript = ruleEvidence(
@@ -1721,6 +2028,119 @@ client.messages.create(model="gpt-old", messages=[])
       policyEligible: false,
     });
     expect(customEndpoint?.servingPlatform).toBeUndefined();
+  });
+
+  test("resolves every accepted Anthropic Python method on both clients", () => {
+    // Qualified against anthropic 1.8.0 (PyPI): 1.0 removed the legacy completions resource,
+    // which no rule read, and kept `model` on every Messages overload the rule accepts.
+    for (const constructor of ["Anthropic", "AsyncAnthropic"]) {
+      for (const method of ["create", "stream", "count_tokens"]) {
+        expect(
+          ruleEvidence(
+            "src/claude.py",
+            `from anthropic import ${constructor}\nclient = ${constructor}()\nclient.messages.${method}(model="gpt-old", messages=[])\n`,
+            "source.py.anthropic.messages-model@1",
+          ),
+          `${constructor}.messages.${method}`,
+        ).toMatchObject({
+          modelId: "gpt-old",
+          servingPlatform: "anthropic",
+          platformResolution: "resolved",
+          policyEligible: true,
+        });
+      }
+    }
+  });
+
+  test("binds the official constructor and instance-attribute forms", () => {
+    // The quickstart shapes of both SDKs and the usual class wrappers. Each fell back to a
+    // text match before, so even production evidence written this way could never block.
+    const cases: ReadonlyArray<readonly [name: string, path: string, source: string, ruleId: string, platform: string]> = [
+      [
+        "module-qualified Anthropic",
+        "app/claude.py",
+        `import anthropic\nclient = anthropic.Anthropic()\nclient.messages.create(model="gpt-old", max_tokens=1, messages=[])\n`,
+        "source.py.anthropic.messages-model@1",
+        "anthropic",
+      ],
+      [
+        "aliased module-qualified async OpenAI",
+        "app/chat.py",
+        `import openai as oa\nclient = oa.AsyncOpenAI()\nawait client.responses.create(model="gpt-old", input="hi")\n`,
+        "source.py.openai.request-model@1",
+        "openai",
+      ],
+      [
+        "Python instance attribute",
+        "app/bot.py",
+        `from anthropic import Anthropic\n\nclass Bot:\n    def __init__(self):\n        self.client = Anthropic()\n\n    def ask(self):\n        return self.client.messages.create(model="gpt-old", max_tokens=1, messages=[])\n`,
+        "source.py.anthropic.messages-model@1",
+        "anthropic",
+      ],
+      [
+        "Python class attribute read through self",
+        "app/bot.py",
+        `from openai import OpenAI\n\nclass Bot:\n    client = OpenAI()\n\n    def ask(self):\n        return self.client.chat.completions.create(model="gpt-old", messages=[])\n`,
+        "source.py.openai.request-model@1",
+        "openai",
+      ],
+      [
+        "TypeScript instance attribute",
+        "src/bot.ts",
+        `import OpenAI from "openai";\nexport class Bot {\n  client: OpenAI;\n  constructor() {\n    this.client = new OpenAI();\n  }\n  ask() {\n    return this.client.chat.completions.create({ model: "gpt-old", messages: [] });\n  }\n}\n`,
+        "source.ts.openai.request-model@1",
+        "openai",
+      ],
+      [
+        "TypeScript class field",
+        "src/bot.ts",
+        `import Anthropic from "@anthropic-ai/sdk";\nexport class Bot {\n  private client = new Anthropic();\n  ask() {\n    return this.client.messages.create({ model: "gpt-old", max_tokens: 1, messages: [] });\n  }\n}\n`,
+        "source.ts.anthropic.messages-model@1",
+        "anthropic",
+      ],
+    ];
+    for (const [name, path, source, ruleId, platform] of cases) {
+      expect(ruleEvidence(path, source, ruleId), name).toMatchObject({
+        modelId: "gpt-old",
+        servingPlatform: platform,
+        platformResolution: "resolved",
+        selectorKind: "model-id",
+        policyEligible: true,
+      });
+    }
+
+    // Module-qualified Azure keeps the deployment-name semantics of its named import.
+    expect(
+      ruleEvidence(
+        "app/chat.py",
+        `import openai\nclient = openai.AzureOpenAI(azure_endpoint="https://example.openai.azure.com")\nclient.chat.completions.create(model="gpt-old", messages=[])\n`,
+        "source.py.openai.request-model@1",
+      ),
+    ).toMatchObject({ servingPlatform: "azure", selectorKind: "deployment-name", policyEligible: false });
+  });
+
+  test("does not bind a bare name from another object's attribute", () => {
+    // `config.client` is not `client`; attributing a later bare call to it could name the
+    // wrong client entirely.
+    const evidence = detectSnapshot(
+      snapshot(
+        "app/chat.py",
+        `from openai import OpenAI\nconfig.client = OpenAI(base_url="https://gateway.example")\nclient.chat.completions.create(model="gpt-old", messages=[])\n`,
+      ),
+      feed,
+    ).evidence;
+    expect(evidence.filter((fact) => fact.kind === "sdk-argument")).toEqual([]);
+    expect(evidence.map((fact) => fact.kind)).toEqual(["lexical"]);
+
+    // A module name reassigned in the file is no longer the SDK.
+    const shadowed = detectSnapshot(
+      snapshot(
+        "app/chat.py",
+        `import anthropic\nanthropic = load_proxy()\nclient = anthropic.Anthropic()\nclient.messages.create(model="gpt-old", messages=[])\n`,
+      ),
+      feed,
+    ).evidence;
+    expect(shadowed.filter((fact) => fact.kind === "sdk-argument")).toEqual([]);
   });
 
   test("distinguishes explicit Google AI Studio and Vertex modes in JavaScript and Python", () => {
@@ -2449,6 +2869,61 @@ client.responses.create({ model: "gpt-old", input: "hello" });
     });
   });
 
+  test("scopes text matches in configuration and deployment files so they can warn", () => {
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ["k8s/deployment.yaml", "deployment"],
+      ["charts/api/templates/deployment.yaml", "deployment"],
+      ["values-prod.yaml", "deployment"],
+      ["docker-compose.yml", "deployment"],
+      ["compose.override.yaml", "deployment"],
+      ["Dockerfile", "deployment"],
+      ["api.Dockerfile", "deployment"],
+      [".env", "deployment"],
+      [".env.production", "deployment"],
+      ["envs/prod.tfvars", "deployment"],
+      // GitHub runs every file in the workflows directory, whatever it is named.
+      [".github/workflows/ci.example.yml", "deployment"],
+      ["config/llm.yaml", "application"],
+      ["settings.json", "application"],
+      ["pyproject.toml", "application"],
+      ["src/main/resources/application.properties", "application"],
+      [".env.example", "example"],
+      ["config.sample.yaml", "example"],
+      ["values.template.yaml", "example"],
+      [".env.test", "test"],
+      ["tests/config.yaml", "test"],
+      ["docs/config.yaml", "documentation"],
+      ["vendor/config.yaml", "unknown"],
+      ["package-lock.json", "unknown"],
+      ["openapi.yaml", "unknown"],
+      ["data/models.csv", "unknown"],
+      // Source files keep their existing classification, so semantic authority is unchanged.
+      ["deploy/run.sh", "application"],
+    ];
+    for (const [path, scope] of cases) {
+      const lexical = detectSnapshot(snapshot(path, 'model = "gpt-old"\n'), feed).evidence.filter(
+        (fact) => fact.detectorRuleId === "fallback.text.lifecycle-id@1",
+      );
+      expect(lexical.map((fact) => [path, fact.scope]), path).toEqual([[path, scope]]);
+      expect(lexical[0]?.policyEligible, path).toBe(false);
+    }
+  });
+
+  test("classifies adversarial configuration file names without catastrophic backtracking", () => {
+    // Repository paths are untrusted. A separator that the name body could also absorb
+    // made these names backtrack exponentially and stall the scan.
+    for (const path of [
+      `values-${"--".repeat(40)}!.yaml`,
+      `docker-compose.${"--".repeat(40)}!.yml`,
+      `openapi-${"--".repeat(40)}!.json`,
+    ]) {
+      const lexical = detectSnapshot(snapshot(path, 'model = "gpt-old"\n'), feed).evidence.filter(
+        (fact) => fact.detectorRuleId === "fallback.text.lifecycle-id@1",
+      );
+      expect(lexical.map((fact) => fact.scope), path).toEqual(["application"]);
+    }
+  });
+
   test("emits non-enforceable evidence for dynamic selectors and endpoints", () => {
     const dynamicSelector = ruleEvidence(
       "src/chat.ts",
@@ -2528,5 +3003,110 @@ resource "azurerm_cognitive_deployment" "malformed" {
         ),
       ).toBe(true);
     }
+  });
+});
+
+describe("keyed fallback for IDs the lexical automaton skips", () => {
+  const shortIdRecord = (recordId: string, servingPlatform: string, modelId: string) => ({
+    recordId,
+    servingPlatform,
+    primarySourceUrl: `https://example.com/${recordId}`,
+    supersedesRecordIds: [],
+    recordKind: "model" as const,
+    modelId,
+    literalScanEligible: false,
+    lifecycleStatus: "shutdown-scheduled" as const,
+    shutdownDate: "2026-10-23",
+    replacementModels: [],
+  });
+  const shortIdFeed = buildV3FeedIndex({
+    schemaVersion: 3,
+    adapter: { id: "fixture", version: "1", sourceSha256: "a".repeat(64) },
+    generatedAt: "2026-08-01T00:00:00Z",
+    records: [
+      shortIdRecord("openai-o1", "openai", "o1"),
+      shortIdRecord("azure-o1", "azure", "o1"),
+      shortIdRecord("azure-tts", "azure", "tts"),
+      {
+        recordId: "old",
+        servingPlatform: "openai",
+        primarySourceUrl: "https://example.com/old",
+        supersedesRecordIds: [],
+        recordKind: "model",
+        modelId: "gpt-old",
+        literalScanEligible: true,
+        lifecycleStatus: "shutdown-scheduled",
+        shutdownDate: "2027-01-01",
+        replacementModels: [],
+      },
+    ],
+  });
+  const keyed = (path: string, source: string) =>
+    detectSnapshot(snapshot(path, source), shortIdFeed).evidence.filter(
+      (fact) => fact.detectorRuleId === "fallback.text.keyed-lifecycle-id@1",
+    );
+
+  test("matches a short ID written as a model key's value in configuration and code", () => {
+    const cases: ReadonlyArray<readonly [path: string, source: string, scope: string]> = [
+      ["config/llm.yaml", "summarizer:\n  model: o1\n", "application"],
+      [".env", "OPENAI_MODEL=o1\n", "deployment"],
+      ["settings.json", '{ "chat_model": "o1" }\n', "application"],
+      ["app/lc.py", 'from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(model="o1")\n', "application"],
+      ["src/config.ts", 'export const CHAT_MODEL = "o1";\n', "application"],
+    ];
+    for (const [path, source, scope] of cases) {
+      expect(keyed(path, source), path).toEqual([
+        expect.objectContaining({
+          kind: "lexical",
+          confidence: "low",
+          modelId: "o1",
+          scope,
+          platformResolution: "ambiguous",
+          policyEligible: false,
+        }),
+      ]);
+    }
+    const [single] = keyed("deploy/speech.yaml", "speech:\n  model: tts\n");
+    expect(single).toMatchObject({
+      servingPlatform: "azure",
+      platformResolution: "resolved",
+      locations: [{ path: "deploy/speech.yaml", line: 2, column: 10 }],
+    });
+  });
+
+  test("ignores prose, comparisons, other keys, bare source identifiers, and eligible IDs", () => {
+    for (const [path, source] of [
+      ["docs/models.md", "We moved from o1 to a newer model.\n"],
+      ["app/route.py", 'if model == "o1":\n    pass\n'],
+      ["src/route.ts", 'if (model === "o1") {}\n'],
+      ["config/app.yaml", "mode: o1\n"],
+      ["app/chat.py", "model = o1\n"],
+      ["config/llm.yaml", "model: o10\n"],
+    ] as const) {
+      expect(keyed(path, source), `${path}: ${source.trim()}`).toEqual([]);
+    }
+    // An ID the lexical automaton already matches is not duplicated by the keyed rule.
+    const eligible = detectSnapshot(snapshot("config/llm.yaml", "model: gpt-old\n"), shortIdFeed).evidence;
+    expect(eligible.map((fact) => fact.detectorRuleId)).toEqual(["fallback.text.lifecycle-id@1"]);
+  });
+
+  test("defers to a semantic fact that joins the feed, but not to one behind a gateway", () => {
+    const direct = detectSnapshot(
+      snapshot("app/chat.py", 'from openai import OpenAI\nclient = OpenAI()\nclient.chat.completions.create(model="o1", messages=[])\n'),
+      shortIdFeed,
+    ).evidence;
+    expect(direct.map((fact) => fact.kind)).toEqual(["sdk-argument"]);
+
+    const gateway = detectSnapshot(
+      snapshot(
+        "app/chat.py",
+        'from openai import OpenAI\nclient = OpenAI(base_url="https://gateway.example")\nclient.chat.completions.create(model="o1", messages=[])\n',
+      ),
+      shortIdFeed,
+    ).evidence;
+    expect(gateway.map((fact) => fact.detectorRuleId).sort()).toEqual([
+      "fallback.text.keyed-lifecycle-id@1",
+      "source.py.openai.request-model@1",
+    ]);
   });
 });

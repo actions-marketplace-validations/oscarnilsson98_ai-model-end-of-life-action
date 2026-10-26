@@ -140,6 +140,126 @@ describe("v3 lifecycle evaluation", () => {
     expect(result.result).toBe("blocking");
   });
 
+  test("a runtime-computed selector is reported without elevating the result", () => {
+    const dynamic = fact({
+      evidenceId: "dynamic-selector",
+      rawValue: "modelId",
+      modelResolution: "dynamic",
+      selectorKind: "dynamic",
+      policyEligible: false,
+    });
+    delete dynamic.modelId;
+    const result = evaluateEvidence({
+      evidence: [dynamic],
+      feed,
+      policy: defaultPolicy(),
+      now: NOW,
+      scanStatus: "complete",
+    });
+
+    // A caller-supplied override has no static value to find, so elevating here would pin
+    // the repository to an advisory no change can clear. The reference is still reported.
+    expect(result.result).toBe("no-actionable-risk");
+    expect(result.scanStatus).toBe("complete");
+    expect(result.findings).toEqual([]);
+    expect(result.unresolved.map((entry) => entry.evidenceId)).toEqual([
+      "dynamic-selector",
+    ]);
+    // It is stated once as a coverage notice instead, so a clean result is not an all-clear.
+    expect(
+      result.diagnostics.filter((diagnostic) => diagnostic.code === "selector-without-model-id"),
+    ).toEqual([
+      {
+        code: "selector-without-model-id",
+        message:
+          "1 model reference(s) in application or deployment code could not be resolved to a model ID (src/chat.ts), so it was not checked for deprecation.",
+        severity: "notice",
+      },
+    ]);
+  });
+
+  test("the unchecked-selector notice names only references nothing checked", () => {
+    const dynamic = (evidenceId: string, overrides: Partial<EvidenceFact> = {}): EvidenceFact => {
+      const entry = fact({
+        evidenceId,
+        rawValue: "modelId",
+        modelResolution: "dynamic",
+        selectorKind: "dynamic",
+        policyEligible: false,
+        ...overrides,
+      });
+      delete entry.modelId;
+      return entry;
+    };
+    const notices = (evidence: EvidenceFact[], index = feed) =>
+      evaluateEvidence({
+        evidence,
+        feed: index,
+        policy: defaultPolicy(),
+        now: NOW,
+        scanStatus: "complete",
+      }).diagnostics.filter((diagnostic) =>
+        diagnostic.code === "selector-without-model-id" ||
+        diagnostic.code === "platform-without-lifecycle-data"
+      );
+
+    // Several references aggregate into one notice with a bounded path sample.
+    expect(
+      notices([
+        dynamic("a", { locations: [{ path: "src/a.ts", line: 1, column: 1 }] }),
+        dynamic("b", { locations: [{ path: "src/b.ts", line: 1, column: 1 }] }),
+        dynamic("b2", { locations: [{ path: "src/b.ts", line: 9, column: 1 }] }),
+        dynamic("c", { locations: [{ path: "src/c.ts", line: 1, column: 1 }] }),
+        dynamic("d", { locations: [{ path: "src/d.ts", line: 1, column: 1 }] }),
+      ]).map((diagnostic) => diagnostic.message),
+    ).toEqual([
+      "5 model reference(s) in application or deployment code could not be resolved to a model ID (src/a.ts, src/b.ts, src/c.ts, +1 more), so they were not checked for deprecation.",
+    ]);
+
+    // A gateway call names its model exactly; the lexical fallback checks that literal.
+    const gateway = fact({ evidenceId: "gateway", platformResolution: "unknown", policyEligible: false });
+    delete gateway.servingPlatform;
+    expect(notices([gateway]), "model known, platform unproven").toEqual([]);
+
+    // A reference on a platform the feed does not cover is named once, by that notice.
+    const bedrock = fact({
+      evidenceId: "bedrock",
+      servingPlatform: "aws-bedrock",
+      rawValue: "anthropic.claude-3-haiku-20240307-v1:0",
+      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      selectorKind: "polymorphic",
+      policyEligible: false,
+    });
+    expect(notices([bedrock]).map((diagnostic) => diagnostic.code)).toEqual([
+      "platform-without-lifecycle-data",
+    ]);
+
+    for (const [name, evidence, index] of [
+      ["test scope", [dynamic("t", { scope: "test", environment: "test" })], feed],
+      ["documentation scope", [dynamic("d", { scope: "documentation" })], feed],
+      ["lexical", [dynamic("l", { kind: "lexical", confidence: "low" })], feed],
+      ["feed unavailable", [dynamic("u")], { ...feed, modelPairs: [] }],
+    ] as const) {
+      expect(notices([...evidence], index), name).toEqual([]);
+    }
+  });
+
+  test("evidence health still elevates when no finding does", () => {
+    const result = evaluateEvidence({
+      evidence: [
+        fact({ rawValue: "model-with-no-record", modelId: "model-with-no-record", evidenceHealth: "stale" }),
+      ],
+      feed,
+      policy: defaultPolicy(),
+      now: NOW,
+      scanStatus: "complete",
+    });
+
+    expect(result.findings).toEqual([]);
+    expect(result.result).toBe("advisory");
+    expect(result.scanStatus).toBe("partial");
+  });
+
   test("covers every independent v3 blocking-eligibility condition", () => {
     const enforced = { ...defaultPolicy(), failWithinDays: 30 };
     const eligibleOrigins: Array<{
@@ -294,6 +414,28 @@ describe("v3 lifecycle evaluation", () => {
     });
     expect(result.result).not.toBe("blocking");
     expect(result.unresolved).toHaveLength(1);
+  });
+
+  test("a text match in a deployment manifest warns but never blocks", () => {
+    const result = evaluateEvidence({
+      evidence: [
+        fact({
+          kind: "lexical",
+          confidence: "low",
+          detectorRuleId: "fallback.text.lifecycle-id@1",
+          policyEligible: false,
+          scope: "deployment",
+          environment: "production",
+          locations: [{ path: "k8s/deployment.yaml", line: 12, column: 22 }],
+        }),
+      ],
+      feed,
+      policy: { ...defaultPolicy(), failWithinDays: 36_500 },
+      now: NOW,
+      scanStatus: "complete",
+    });
+    expect(result.findings.map((finding) => finding.outcome)).toEqual(["warning"]);
+    expect(result.result).toBe("advisory");
   });
 
   test("collapses one unproven-platform occurrence into a single finding", () => {
@@ -710,7 +852,7 @@ describe("warning horizon date precedence", () => {
     expect(result.findings[0]?.outcome).toBe("breach");
   });
 
-  test("findings sort by the deadline the horizon measures", () => {
+  test("findings sort by shutdown, not by the date that opened the horizon", () => {
     const evaluation = evaluateEvidence({
       evidence: [
         fact({ evidenceId: "near-deprecation", rawValue: "gpt-old", modelId: "gpt-old" }),
@@ -757,9 +899,128 @@ describe("warning horizon date precedence", () => {
       now: NOW,
       scanStatus: "complete",
     });
+    // A deprecation long past still warns, but the model that stops serving first leads.
     expect(evaluation.findings.map((finding) => finding.modelId)).toEqual([
-      "gpt-old",
       "gpt-other",
+      "gpt-old",
     ]);
+    expect(evaluation.findings.every((finding) => finding.outcome === "warning")).toBe(true);
+  });
+});
+
+describe("serving platforms the feed publishes nothing for", () => {
+  function bedrockFact(overrides: Partial<EvidenceFact> = {}): EvidenceFact {
+    return fact({
+      evidenceId: "bedrock",
+      detectorRuleId: "source.py.aws-bedrock.invoke-model@1",
+      rawValue: "anthropic.claude-3-haiku-20240307-v1:0",
+      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      servingPlatform: "aws-bedrock",
+      selectorKind: "polymorphic",
+      policyEligible: false,
+      locations: [{ path: "app/bedrock.py", line: 5, column: 40 }],
+      ...overrides,
+    });
+  }
+
+  function uncoveredNotices(evidence: EvidenceFact[], index = feed) {
+    const result = evaluateEvidence({
+      evidence,
+      feed: index,
+      policy: { ...defaultPolicy(), failWithinDays: 30 },
+      now: NOW,
+      scanStatus: "complete",
+    });
+    return {
+      result,
+      notices: result.diagnostics.filter(
+        (diagnostic) => diagnostic.code === "platform-without-lifecycle-data",
+      ),
+    };
+  }
+
+  test("names every uncovered platform once, without changing coverage or findings", () => {
+    const { result, notices } = uncoveredNotices([
+      bedrockFact(),
+      bedrockFact({
+        evidenceId: "bedrock-second-call",
+        locations: [{ path: "app/bedrock.py", line: 9, column: 40 }],
+      }),
+      bedrockFact({
+        evidenceId: "bedrock-deploy",
+        scope: "deployment",
+        locations: [{ path: "src/summarize.ts", line: 3, column: 12 }],
+      }),
+      bedrockFact({
+        evidenceId: "mistral",
+        servingPlatform: "mistral",
+        locations: [{ path: "src/mistral.ts", line: 1, column: 1 }],
+      }),
+      fact(),
+    ]);
+    expect(notices).toEqual([
+      {
+        code: "platform-without-lifecycle-data",
+        message:
+          "The lifecycle feed publishes no records for aws-bedrock (3 reference(s): app/bedrock.py, src/summarize.ts); mistral (1 reference(s): src/mistral.ts), so those model references were not checked for deprecation.",
+        severity: "notice",
+      },
+    ]);
+    expect(result.scanStatus).toBe("complete");
+    expect(result.findings.map((finding) => finding.servingPlatform)).toEqual(["openai"]);
+  });
+
+  test("stays silent where it would only add noise", () => {
+    const cases: Array<{ name: string; evidence: EvidenceFact[]; index?: typeof feed }> = [
+      { name: "covered platform, model not deprecated", evidence: [fact({ modelId: "gpt-new" })] },
+      { name: "test scope", evidence: [bedrockFact({ scope: "test", environment: "test" })] },
+      { name: "documentation scope", evidence: [bedrockFact({ scope: "documentation" })] },
+      { name: "unknown scope", evidence: [bedrockFact({ scope: "unknown" })] },
+      {
+        name: "platform not established",
+        evidence: [
+          (({ servingPlatform: _platform, ...rest }) => ({
+            ...rest,
+            platformResolution: "unknown" as const,
+          }))(bedrockFact()),
+        ],
+      },
+      // An empty feed is an outage that feed-unavailable already reports.
+      { name: "feed unavailable", evidence: [bedrockFact()], index: { ...feed, modelPairs: [] } },
+    ];
+    for (const candidate of cases) {
+      expect(uncoveredNotices(candidate.evidence, candidate.index).notices, candidate.name)
+        .toEqual([]);
+    }
+  });
+
+  test("a trusted resolution onto a covered platform clears the gap", () => {
+    const result = evaluateEvidence({
+      evidence: [bedrockFact()],
+      feed,
+      policy: {
+        ...defaultPolicy(),
+        resolutions: [
+          {
+            resolutionId: "bedrock-haiku",
+            match: {
+              detectorRuleId: "source.py.aws-bedrock.invoke-model@1",
+              rawValue: "anthropic.claude-3-haiku-20240307-v1:0",
+              paths: ["app/**"],
+            },
+            resolveTo: { servingPlatform: "openai", modelId: "gpt-old" },
+            reason: "fixture",
+            reviewedAt: "2026-07-01T00:00:00Z",
+            reviewAfter: "2026-12-01T00:00:00Z",
+            expiresAt: "2027-01-01T00:00:00Z",
+          },
+        ],
+      },
+      now: NOW,
+      scanStatus: "complete",
+    });
+    expect(
+      result.diagnostics.some((diagnostic) => diagnostic.code === "platform-without-lifecycle-data"),
+    ).toBe(false);
   });
 });

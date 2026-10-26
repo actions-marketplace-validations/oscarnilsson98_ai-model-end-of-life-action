@@ -606,36 +606,38 @@ var require_Alias = __commonJS((exports2) => {
         if (node.anchor === this.source)
           found = node;
       }
+      if (found && ctx) {
+        const { anchors: anchors2, doc: doc2, maxAliasCount } = ctx;
+        let data = anchors2.get(found);
+        if (!data) {
+          toJS.toJS(found, null, ctx);
+          data = anchors2.get(found);
+        }
+        if (data?.res === undefined) {
+          const msg = "This should not happen: Alias anchor was not resolved?";
+          throw new ReferenceError(msg);
+        }
+        if (maxAliasCount >= 0) {
+          data.count += 1;
+          if (data.aliasCount === 0)
+            data.aliasCount = getAliasCount(doc2, found, anchors2);
+          if (data.count * data.aliasCount > maxAliasCount) {
+            const msg = "Excessive alias count indicates a resource exhaustion attack";
+            throw new ReferenceError(msg);
+          }
+        }
+      }
       return found;
     }
     toJSON(_arg, ctx) {
       if (!ctx)
         return { source: this.source };
-      const { anchors: anchors2, doc, maxAliasCount } = ctx;
-      const source = this.resolve(doc, ctx);
+      const source = this.resolve(ctx.doc, ctx);
       if (!source) {
         const msg = `Unresolved alias (the anchor must be set before the alias): ${this.source}`;
         throw new ReferenceError(msg);
       }
-      let data = anchors2.get(source);
-      if (!data) {
-        toJS.toJS(source, null, ctx);
-        data = anchors2.get(source);
-      }
-      if (data?.res === undefined) {
-        const msg = "This should not happen: Alias anchor was not resolved?";
-        throw new ReferenceError(msg);
-      }
-      if (maxAliasCount >= 0) {
-        data.count += 1;
-        if (data.aliasCount === 0)
-          data.aliasCount = getAliasCount(doc, source, anchors2);
-        if (data.count * data.aliasCount > maxAliasCount) {
-          const msg = "Excessive alias count indicates a resource exhaustion attack";
-          throw new ReferenceError(msg);
-        }
-      }
-      return data.res;
+      return ctx.anchors.get(source).res;
     }
     toString(ctx, _onComment, _onChompKeep) {
       const src = `*${this.source}`;
@@ -4397,33 +4399,32 @@ var require_resolve_flow_scalar = __commonJS((exports2) => {
     }
     if (badChar)
       onError(0, "BAD_SCALAR_START", `Plain value cannot start with ${badChar}`);
-    return foldLines(source);
+    return unfoldLines(source);
   }
   function singleQuotedValue(source, onError) {
     if (source[source.length - 1] !== "'" || source.length === 1)
       onError(source.length, "MISSING_CHAR", "Missing closing 'quote");
-    return foldLines(source.slice(1, -1)).replace(/''/g, "'");
+    return unfoldLines(source.slice(1, -1)).replace(/''/g, "'");
   }
-  function foldLines(source) {
-    let first, line;
-    try {
-      first = new RegExp(`(.*?)(?<![ 	])[ 	]*\r?
-`, "sy");
-      line = new RegExp(`[ 	]*(.*?)(?:(?<![ 	])[ 	]*)?\r?
-`, "sy");
-    } catch {
-      first = /(.*?)[ \t]*\r?\n/sy;
-      line = /[ \t]*(.*?)[ \t]*\r?\n/sy;
-    }
-    let match = first.exec(source);
+  function unfoldLines(source) {
+    const line = /(.*?)\r?\n/sy;
+    let match = line.exec(source);
     if (!match)
       return source;
-    let res = match[1];
+    let trimEnd, trimBoth;
+    try {
+      trimEnd = new RegExp("(?<![ \t])[ \t]+$");
+      trimBoth = new RegExp("^[ \t]+|(?<![ \t])[ \t]+$", "g");
+    } catch {
+      trimEnd = /[ \t]+$/;
+      trimBoth = /^[ \t]+|[ \t]+$/g;
+    }
+    let res = match[1].replace(trimEnd, "");
     let sep = " ";
-    let pos = first.lastIndex;
-    line.lastIndex = pos;
+    let pos = line.lastIndex;
     while (match = line.exec(source)) {
-      if (match[1] === "") {
+      const lm = match[1].replace(trimBoth, "");
+      if (lm === "") {
         if (sep === `
 `)
           res += sep;
@@ -4431,7 +4432,7 @@ var require_resolve_flow_scalar = __commonJS((exports2) => {
           sep = `
 `;
       } else {
-        res += sep + match[1];
+        res += sep + lm;
         sep = " ";
       }
       pos = line.lastIndex;
@@ -7899,6 +7900,44 @@ function deprecationLeadsHorizon(finding) {
     return false;
   return finding.daysUntilShutdown === null || (finding.daysUntilDeprecation ?? 0) < finding.daysUntilShutdown;
 }
+var UNCOVERED_PLATFORM_DIAGNOSTIC = "platform-without-lifecycle-data";
+var UNRESOLVED_SELECTOR_DIAGNOSTIC = "selector-without-model-id";
+var NOT_ASSESSED_DIAGNOSTICS = new Set([
+  UNCOVERED_PLATFORM_DIAGNOSTIC,
+  UNRESOLVED_SELECTOR_DIAGNOSTIC
+]);
+function hasShutDown(finding) {
+  return finding.daysUntilShutdown !== null && finding.daysUntilShutdown < 0;
+}
+function shutdownText(finding) {
+  const { shutdownDate: date, daysUntilShutdown: days } = finding;
+  if (date === undefined)
+    return "shutdown date not announced";
+  if (days === null || !Number.isSafeInteger(days))
+    return `shutdown ${date}`;
+  if (days < 0)
+    return `shut down ${date} (${-days}d ago)`;
+  if (days === 0)
+    return `shuts down today (${date})`;
+  return `shutdown ${date} (in ${days}d)`;
+}
+function deprecationText(finding) {
+  const date = finding.deprecationDate;
+  if (date === undefined || !deprecationLeadsHorizon(finding) || hasShutDown(finding)) {
+    return null;
+  }
+  const days = finding.daysUntilDeprecation;
+  if (days === undefined || !Number.isSafeInteger(days))
+    return `deprecation ${date}`;
+  if (days < 0)
+    return `deprecated ${date} (${-days}d ago)`;
+  if (days === 0)
+    return `deprecated today (${date})`;
+  return `deprecation ${date} (in ${days}d)`;
+}
+function shutdownOrderDays(finding) {
+  return finding.daysUntilShutdown ?? Number.MAX_SAFE_INTEGER;
+}
 function resultFromFindings(findings) {
   let result = "no-actionable-risk";
   for (const finding of findings) {
@@ -7945,6 +7984,9 @@ var SCOPES = [
   "unknown"
 ];
 var RESOLUTIONS = ["resolved", "dynamic", "unresolved"];
+function isPolicyRelevantUnresolved(fact) {
+  return fact.kind !== "lexical" && fact.confidence !== "low" && (fact.scope === "application" || fact.scope === "deployment");
+}
 function buildCounts(evidence, findings, unresolved) {
   const byScope = Object.fromEntries(SCOPES.map((scope) => [scope, 0]));
   const byResolution = Object.fromEntries(RESOLUTIONS.map((resolution) => [resolution, 0]));
@@ -7977,7 +8019,7 @@ function alertFingerprint(findings) {
 }
 
 // src/detection/manifest.ts
-var DETECTOR_MANIFEST_VERSION = "3.0.0-6";
+var DETECTOR_MANIFEST_VERSION = "3.0.0-10";
 var DETECTOR_QUALIFICATION = Object.freeze([
   Object.freeze({
     ecosystem: "npm",
@@ -7988,8 +8030,8 @@ var DETECTOR_QUALIFICATION = Object.freeze([
   Object.freeze({
     ecosystem: "pypi",
     package: "openai",
-    version: "2.46.0",
-    sourceUrl: "https://pypi.org/project/openai/2.46.0/"
+    version: "3.19.2",
+    sourceUrl: "https://pypi.org/project/openai/3.19.2/"
   }),
   Object.freeze({
     ecosystem: "npm",
@@ -8000,8 +8042,8 @@ var DETECTOR_QUALIFICATION = Object.freeze([
   Object.freeze({
     ecosystem: "pypi",
     package: "anthropic",
-    version: "0.117.0",
-    sourceUrl: "https://pypi.org/project/anthropic/0.117.0/"
+    version: "1.8.0",
+    sourceUrl: "https://pypi.org/project/anthropic/1.8.0/"
   }),
   Object.freeze({
     ecosystem: "npm",
@@ -8090,8 +8132,8 @@ var DETECTOR_QUALIFICATION = Object.freeze([
   Object.freeze({
     ecosystem: "npm",
     package: "@ai-sdk/xai",
-    version: "4.0.27",
-    sourceUrl: "https://www.npmjs.com/package/@ai-sdk/xai/v/4.0.27"
+    version: "5.0.7",
+    sourceUrl: "https://www.npmjs.com/package/@ai-sdk/xai/v/5.0.7"
   })
 ]);
 var DETECTOR_RULES = Object.freeze([
@@ -8229,6 +8271,12 @@ var DETECTOR_RULES = Object.freeze([
   },
   {
     ruleId: "fallback.text.lifecycle-id@1",
+    languages: ["text"],
+    confidence: "low",
+    policyEligible: false
+  },
+  {
+    ruleId: "fallback.text.keyed-lifecycle-id@1",
     languages: ["text"],
     confidence: "low",
     policyEligible: false
@@ -9191,11 +9239,7 @@ function aggregateFindings(findings) {
     if (existing.suppressedBy !== finding.suppressedBy)
       delete existing.suppressedBy;
   }
-  return [...byKey.values()].sort((left, right) => {
-    const daysLeft = earliestLifecycleDays(left) ?? Number.MAX_SAFE_INTEGER;
-    const daysRight = earliestLifecycleDays(right) ?? Number.MAX_SAFE_INTEGER;
-    return daysLeft - daysRight || compareText3(left.semanticKey, right.semanticKey);
-  });
+  return [...byKey.values()].sort((left, right) => shutdownOrderDays(left) - shutdownOrderDays(right) || compareText3(left.semanticKey, right.semanticKey));
 }
 function applySuppressions(findings, evidenceById, policy, now, diagnostics) {
   const current = policy.suppressions.filter((suppression) => {
@@ -9227,8 +9271,69 @@ function applySuppressions(findings, evidenceById, policy, now, diagnostics) {
 function evidenceHealth(evidence) {
   return combineEvidenceHealth(...evidence.map((fact) => fact.evidenceHealth ?? "current"));
 }
-function unresolvedIsAdvisory(fact) {
-  return fact.kind !== "lexical" && fact.confidence !== "low" && (fact.scope === "application" || fact.scope === "deployment");
+var MAX_UNCOVERED_PLATFORMS = 5;
+var MAX_NOT_ASSESSED_PATHS = 3;
+function pathSample(paths) {
+  const sorted = [...paths].sort(compareText3);
+  const more = sorted.length > MAX_NOT_ASSESSED_PATHS ? `, +${sorted.length - MAX_NOT_ASSESSED_PATHS} more` : "";
+  return `${sorted.slice(0, MAX_NOT_ASSESSED_PATHS).join(", ")}${more}`;
+}
+function onUncoveredPlatform(fact, published) {
+  return fact.servingPlatform !== undefined && fact.platformResolution === "resolved" && !published.has(fact.servingPlatform);
+}
+function uncoveredPlatformDiagnostic(evidence, feed) {
+  if (feed.modelPairs.length === 0)
+    return;
+  const published = new Set(feed.modelPairs.map((pair) => pair.servingPlatform));
+  const locationsByPlatform = new Map;
+  for (const fact of evidence) {
+    const platform2 = fact.servingPlatform;
+    const location = fact.locations[0];
+    if (platform2 === undefined || location === undefined || !onUncoveredPlatform(fact, published) || fact.scope !== "application" && fact.scope !== "deployment") {
+      continue;
+    }
+    const locations = locationsByPlatform.get(platform2) ?? new Map;
+    locations.set(`${location.path}:${location.line}:${location.column}`, location.path);
+    locationsByPlatform.set(platform2, locations);
+  }
+  if (locationsByPlatform.size === 0)
+    return;
+  const platforms = [...locationsByPlatform.keys()].sort(compareText3);
+  const references = [...locationsByPlatform.values()].reduce((total, locations) => total + locations.size, 0);
+  const described = platforms.slice(0, MAX_UNCOVERED_PLATFORMS).map((platform2) => {
+    const locations = locationsByPlatform.get(platform2) ?? new Map;
+    return `${platform2} (${locations.size} reference(s): ${pathSample(new Set(locations.values()))})`;
+  });
+  if (platforms.length > MAX_UNCOVERED_PLATFORMS) {
+    described.push(`${platforms.length - MAX_UNCOVERED_PLATFORMS} more platform(s)`);
+  }
+  return {
+    code: UNCOVERED_PLATFORM_DIAGNOSTIC,
+    message: `The lifecycle feed publishes no records for ${described.join("; ")}, so ${references === 1 ? "that model reference was" : "those model references were"} not checked for deprecation.`,
+    severity: "notice"
+  };
+}
+function unresolvedSelectorDiagnostic(unresolved, findings, feed) {
+  if (feed.modelPairs.length === 0)
+    return;
+  const published = new Set(feed.modelPairs.map((pair) => pair.servingPlatform));
+  const checked = new Set(findings.flatMap((finding) => finding.evidenceIds));
+  const locations = new Map;
+  for (const fact of unresolved) {
+    const location = fact.locations[0];
+    const modelUnknown = fact.modelResolution !== "resolved" || fact.modelId === undefined || fact.selectorKind !== "model-id";
+    if (location === undefined || !modelUnknown || !isPolicyRelevantUnresolved(fact) || checked.has(fact.evidenceId) || onUncoveredPlatform(fact, published)) {
+      continue;
+    }
+    locations.set(`${location.path}:${location.line}:${location.column}`, location.path);
+  }
+  if (locations.size === 0)
+    return;
+  return {
+    code: UNRESOLVED_SELECTOR_DIAGNOSTIC,
+    message: `${locations.size} model reference(s) in application or deployment code could not be resolved to a model ID (${pathSample(new Set(locations.values()))}), so ${locations.size === 1 ? "it was" : "they were"} not checked for deprecation.`,
+    severity: "notice"
+  };
 }
 function evaluateEvidence(input) {
   const diagnostics = [...input.diagnostics ?? []];
@@ -9249,9 +9354,15 @@ function evaluateEvidence(input) {
   const evidenceById = new Map(scoped.map((fact) => [fact.evidenceId, fact]));
   applySuppressions(rawFindings, evidenceById, input.policy, input.now, diagnostics);
   const findings = aggregateFindings(rawFindings);
+  const uncovered = uncoveredPlatformDiagnostic(scoped, input.feed);
+  if (uncovered !== undefined)
+    diagnostics.push(uncovered);
+  const unchecked = unresolvedSelectorDiagnostic(unresolved, findings, input.feed);
+  if (unchecked !== undefined)
+    diagnostics.push(unchecked);
   let result = resultFromFindings(findings);
   const health = evidenceHealth(scoped);
-  if (result === "no-actionable-risk" && (unresolved.some(unresolvedIsAdvisory) || health !== "current")) {
+  if (result === "no-actionable-risk" && health !== "current") {
     result = "advisory";
   }
   return {
@@ -9686,6 +9797,48 @@ var SOURCE_EXTENSIONS = new Set([
 var JS_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]);
 var JSX_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".tsx"]);
 var HCL_EXTENSIONS = new Set([".tf", ".hcl"]);
+var CONFIGURATION_EXTENSIONS = new Set([
+  ".yaml",
+  ".yml",
+  ".json",
+  ".jsonc",
+  ".json5",
+  ".toml",
+  ".ini",
+  ".cfg",
+  ".conf",
+  ".properties",
+  ".env"
+]);
+var DEPLOYMENT_DIRECTORIES = new Set([
+  "k8s",
+  "kubernetes",
+  "kube",
+  "helm",
+  "charts",
+  "manifests",
+  "kustomize",
+  "deploy",
+  "deployment",
+  "deployments",
+  "infra",
+  "infrastructure"
+]);
+var DEPLOYMENT_FILE_NAMES = new Set([
+  "procfile",
+  "serverless.yml",
+  "serverless.yaml",
+  "chart.yml",
+  "chart.yaml",
+  "kustomization.yml",
+  "kustomization.yaml",
+  "skaffold.yaml",
+  "fly.toml",
+  "render.yaml"
+]);
+var DEPLOYMENT_FILE_PATTERN = /^(?:(?:docker-)?compose|values|helmfile)(?:[.-][a-z0-9_.-]*)?\.ya?ml$|^(?:dockerfile|containerfile)(?:\.[a-z0-9_-]+)*$|\.(?:dockerfile|containerfile|tfvars|bicep|tfvars\.json|tf\.json)$/u;
+var NON_SELECTING_CONFIGURATION_FILE = /^(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.ya?ml|(?:openapi|swagger)(?:[.-][a-z0-9_.-]*)?\.(?:json|ya?ml))$/u;
+var CONFIGURATION_EXAMPLE_PARTS = new Set(["example", "sample", "template", "dist"]);
 var IDENTIFIER_CHARACTER = /^[\p{L}\p{N}\p{M}._:/-]$/u;
 var DIRECT_POLICY_RULES = new Set(DETECTOR_RULES.filter((rule) => rule.policyEligible).map((rule) => rule.ruleId));
 
@@ -10708,64 +10861,226 @@ function analyzeTokens(tokens, language) {
   };
 }
 var DIRECT_VALUE_TERMINATORS = new Set([",", ")", "}", "]", ";"]);
+function directValueEnd(tokens, valueIndex) {
+  if (tokens[valueIndex]?.kind !== "identifier")
+    return valueIndex;
+  let end = valueIndex;
+  while (structuralValue(tokens[end + 1]) === "." && tokens[end + 2]?.kind === "identifier") {
+    end += 2;
+  }
+  return end;
+}
+function memberPath(tokens, start, end) {
+  const parts = [];
+  for (let index = start;index <= end; index += 2) {
+    parts.push(tokens[index]?.value ?? "");
+  }
+  return parts.join(".");
+}
 function isCompleteDirectValue(tokens, valueIndex, allowLineBoundary = false) {
   const value = tokens[valueIndex];
-  const next = tokens[valueIndex + 1];
-  if (value === undefined || next === undefined)
-    return value !== undefined;
+  if (value === undefined)
+    return false;
+  const end = directValueEnd(tokens, valueIndex);
+  const last = tokens[end] ?? value;
+  const next = tokens[end + 1];
+  if (next === undefined)
+    return true;
   if (DIRECT_VALUE_TERMINATORS.has(next.value))
     return true;
-  return allowLineBoundary && next.line > value.line;
+  return allowLineBoundary && next.line > last.line;
+}
+function isSpreadAt(tokens, index) {
+  return structuralValue(tokens[index]) === "." && structuralValue(tokens[index + 1]) === "." && structuralValue(tokens[index + 2]) === ".";
+}
+function objectValueEnd(tokens, valueIndex, close) {
+  let depth = 0;
+  for (let index = valueIndex;index < close; index += 1) {
+    const value = structuralValue(tokens[index]);
+    if (value === "{" || value === "[" || value === "(")
+      depth += 1;
+    else if (value === "}" || value === "]" || value === ")")
+      depth = Math.max(0, depth - 1);
+    else if (value === "," && depth === 0)
+      return index;
+  }
+  return close;
+}
+var MAX_OBJECT_PATH_DEPTH = 12;
+var IDENTIFIER_KEY = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+function readObjectPaths(tokens, open, close, prefix, out, depth = 0) {
+  if (depth > MAX_OBJECT_PATH_DEPTH)
+    return false;
+  const seen = new Set;
+  let cursor = open + 1;
+  while (cursor < close) {
+    if (structuralValue(tokens[cursor]) === ",") {
+      cursor += 1;
+      continue;
+    }
+    if (isSpreadAt(tokens, cursor))
+      return false;
+    const keyToken = tokens[cursor];
+    const key = keyToken?.kind === "identifier" || keyToken?.kind === "string" && keyToken.static ? keyToken.value : undefined;
+    if (key === undefined || structuralValue(tokens[cursor + 1]) !== ":")
+      return false;
+    if (key.includes("."))
+      return false;
+    if (seen.has(key))
+      return false;
+    seen.add(key);
+    const valueIndex = cursor + 2;
+    const valueEnd = objectValueEnd(tokens, valueIndex, close);
+    const valueToken = tokens[valueIndex];
+    if (!IDENTIFIER_KEY.test(key)) {
+      cursor = valueEnd + 1;
+      continue;
+    }
+    if (structuralValue(valueToken) === "{") {
+      const nestedClose = matchingIndex(tokens, valueIndex, "{", "}");
+      if (nestedClose === null || nestedClose > valueEnd)
+        return false;
+      if (!readObjectPaths(tokens, valueIndex, nestedClose, `${prefix}.${key}`, out, depth + 1)) {
+        return false;
+      }
+    } else if (valueToken?.kind === "string" && valueToken.static && valueEnd === valueIndex + 1) {
+      out.set(`${prefix}.${key}`, valueToken.value);
+    }
+    cursor = valueEnd + 1;
+  }
+  return true;
+}
+function collectObjectPaths(tokens, analysis) {
+  const paths = new Map;
+  const declared = new Set;
+  const rejected = new Set;
+  for (let index = 0;index < tokens.length; index += 1) {
+    if (!isIdentifier(tokens[index], "const"))
+      continue;
+    const name = tokens[index + 1];
+    if (name?.kind !== "identifier" || structuralValue(tokens[index + 2]) !== "=" || structuralValue(tokens[index + 3]) !== "{") {
+      continue;
+    }
+    const root = name.value;
+    const close = matchingIndex(tokens, index + 3, "{", "}");
+    if (close === null || declared.has(root) || (analysis.assignmentCounts.get(root) ?? 0) !== 1 || analysis.parameterNames.has(root)) {
+      declared.add(root);
+      rejected.add(root);
+      continue;
+    }
+    declared.add(root);
+    const collected = new Map;
+    if (readObjectPaths(tokens, index + 3, close, root, collected)) {
+      for (const [path, value] of collected)
+        paths.set(path, value);
+    } else {
+      rejected.add(root);
+    }
+    index = close;
+  }
+  for (const path of [...paths.keys()]) {
+    if (rejected.has(path.slice(0, path.indexOf("."))))
+      paths.delete(path);
+  }
+  return paths;
+}
+var EMPTY_SCALARS = new Map;
+function staticFallbackIndex(tokens, valueIndex, language) {
+  const end = directValueEnd(tokens, valueIndex);
+  const operator = tokens[end + 1];
+  if (language === "python")
+    return isIdentifier(operator, "or") ? end + 2 : undefined;
+  if (operator?.value === "??" || operator?.value === "||")
+    return end + 2;
+  if (operator?.value === "|" && tokens[end + 2]?.value === "|")
+    return end + 3;
+  return;
+}
+function staticAtomAt(tokens, valueIndex, constants) {
+  const token = tokens[valueIndex];
+  if (token?.kind === "string" && token.static) {
+    return {
+      value: token.value,
+      dynamic: false,
+      trace: [{ kind: "detector", detail: "direct static string" }]
+    };
+  }
+  if (token?.kind !== "identifier")
+    return;
+  const end = directValueEnd(tokens, valueIndex);
+  if (end > valueIndex) {
+    const path = memberPath(tokens, valueIndex, end);
+    const value = constants.objectPaths.get(path);
+    return value === undefined ? undefined : {
+      value,
+      dynamic: false,
+      trace: [{ kind: "constant", detail: `same-file object path ${path}` }]
+    };
+  }
+  const constant = constants.scalars.get(token.value);
+  return constant === undefined ? undefined : {
+    ...constant,
+    trace: [
+      { kind: "constant", detail: `same-file constant ${token.value}` },
+      ...constant.trace
+    ]
+  };
+}
+function staticAtom(tokens, valueIndex, constants, allowLineBoundary = false) {
+  return isCompleteDirectValue(tokens, valueIndex, allowLineBoundary) ? staticAtomAt(tokens, valueIndex, constants) : undefined;
+}
+function resolveValueExpression(tokens, valueIndex, constants, allowLineBoundary = false) {
+  const fallbackIndex = staticFallbackIndex(tokens, valueIndex, constants.language);
+  if (fallbackIndex !== undefined) {
+    const left = staticAtomAt(tokens, valueIndex, constants);
+    if (left !== undefined && left.value !== "")
+      return left;
+    const fallback = staticAtom(tokens, fallbackIndex, constants, allowLineBoundary);
+    return fallback === undefined ? undefined : {
+      value: fallback.value,
+      dynamic: true,
+      trace: [
+        { kind: "detector", detail: "static default behind a runtime selector" },
+        ...fallback.trace
+      ]
+    };
+  }
+  return staticAtom(tokens, valueIndex, constants, allowLineBoundary);
 }
 function collectConstants(tokens, language, analysis) {
+  const objectPaths = language === "javascript" ? collectObjectPaths(tokens, analysis) : new Map;
+  const atoms = { scalars: EMPTY_SCALARS, objectPaths, language };
   const candidates = new Map;
   const record = (name, value) => {
     candidates.set(name, candidates.has(name) ? null : value);
   };
-  let braceDepth = 0;
+  const consider = (name, valueIndex) => {
+    const resolved = resolveValueExpression(tokens, valueIndex, atoms, true);
+    if (resolved === undefined)
+      return;
+    record(name, {
+      ...resolved,
+      trace: resolved.trace.filter((entry) => entry.detail !== "direct static string")
+    });
+  };
   for (let index = 0;index < tokens.length; index += 1) {
     if (language === "javascript") {
-      if (structuralValue(tokens[index]) === "{") {
-        braceDepth += 1;
-        continue;
-      }
-      if (structuralValue(tokens[index]) === "}") {
-        braceDepth = Math.max(0, braceDepth - 1);
-        continue;
-      }
-      if (braceDepth === 0 && isIdentifier(tokens[index], "const") && tokens[index + 1]?.kind === "identifier" && tokens[index + 2]?.value === "=" && tokens[index + 3]?.kind === "string" && tokens[index + 3]?.static && isCompleteDirectValue(tokens, index + 3, true)) {
-        record(tokens[index + 1]?.value, tokens[index + 3]?.value);
+      if (isIdentifier(tokens[index], "const") && tokens[index + 1]?.kind === "identifier" && tokens[index + 2]?.value === "=") {
+        consider(tokens[index + 1]?.value, index + 3);
       }
       continue;
     }
     const token = tokens[index];
-    if (token?.kind === "identifier" && token.column === 1 && structuralValue(tokens[index + 1]) === "=" && tokens[index + 2]?.kind === "string" && tokens[index + 2]?.static && isCompleteDirectValue(tokens, index + 2, true)) {
-      record(token.value, tokens[index + 2]?.value);
+    if (token?.kind === "identifier" && token.column === 1 && structuralValue(tokens[index + 1]) === "=") {
+      consider(token.value, index + 2);
     }
   }
   const { parameterNames: shadowed, assignmentCounts } = analysis;
-  return new Map([...candidates.entries()].filter((entry) => entry[1] !== null && !shadowed.has(entry[0]) && (assignmentCounts.get(entry[0]) ?? 0) === 1));
-}
-function staticAtom(tokens, valueIndex, constants) {
-  if (!isCompleteDirectValue(tokens, valueIndex))
-    return;
-  const token = tokens[valueIndex];
-  if (token?.kind === "string" && token.static) {
-    return {
-      modelId: token.value,
-      trace: [{ kind: "detector", detail: "direct static string" }]
-    };
-  }
-  if (token?.kind === "identifier") {
-    const constant = constants.get(token.value);
-    if (constant !== undefined) {
-      return {
-        modelId: constant,
-        trace: [{ kind: "constant", detail: `same-file constant ${token.value}` }]
-      };
-    }
-  }
-  return;
+  return {
+    scalars: new Map([...candidates.entries()].filter((entry) => entry[1] !== null && !shadowed.has(entry[0]) && (assignmentCounts.get(entry[0]) ?? 0) === 1)),
+    objectPaths,
+    language
+  };
 }
 function resolveTokenValue(tokens, valueIndex, constants, defaultSelectorKind, environmentReference) {
   const token = tokens[valueIndex];
@@ -10773,8 +11088,8 @@ function resolveTokenValue(tokens, valueIndex, constants, defaultSelectorKind, e
     const fallback = environmentReference.fallbackIndex === undefined ? undefined : staticAtom(tokens, environmentReference.fallbackIndex, constants);
     if (fallback !== undefined) {
       return {
-        rawValue: fallback.modelId,
-        modelId: fallback.modelId,
+        rawValue: fallback.value,
+        modelId: fallback.value,
         modelResolution: "resolved",
         selectorKind: "dynamic",
         trace: [
@@ -10800,13 +11115,13 @@ function resolveTokenValue(tokens, valueIndex, constants, defaultSelectorKind, e
       environmentVariable: environmentReference.variable
     };
   }
-  const resolved = staticAtom(tokens, valueIndex, constants);
+  const resolved = resolveValueExpression(tokens, valueIndex, constants);
   if (resolved !== undefined) {
     return {
-      rawValue: token?.kind === "identifier" ? token.value : resolved.modelId,
-      modelId: resolved.modelId,
+      rawValue: resolved.dynamic ? resolved.value : token?.kind === "identifier" ? memberPath(tokens, valueIndex, directValueEnd(tokens, valueIndex)) : resolved.value,
+      modelId: resolved.value,
       modelResolution: "resolved",
-      selectorKind: defaultSelectorKind,
+      selectorKind: resolved.dynamic ? "dynamic" : defaultSelectorKind,
       trace: resolved.trace
     };
   }
@@ -11030,6 +11345,9 @@ function isBareAssignmentTarget(tokens, index) {
   const previous = structuralValue(tokens[index - 1]);
   return previous !== "." && previous !== "?.";
 }
+function isMemberAccessBefore(tokens, index) {
+  return !isBareAssignmentTarget(tokens, index);
+}
 function conflictAwareBindings() {
   const bindings = new Map;
   const conflicted = new Set;
@@ -11058,7 +11376,8 @@ function assignmentTargetCounts(tokens) {
 }
 function pruneUntrustedBindings(bindings, analysis) {
   for (const variable of [...bindings.keys()]) {
-    if ((analysis.assignmentCounts.get(variable) ?? 0) > 1 || analysis.parameterNames.has(variable)) {
+    const assigned = variable.includes(".") ? variable.slice(variable.indexOf(".") + 1) : variable;
+    if ((analysis.assignmentCounts.get(assigned) ?? 0) > 1 || analysis.parameterNames.has(variable)) {
       bindings.delete(variable);
     }
   }
@@ -11110,6 +11429,7 @@ function importProvenance(tokens, language, analysis) {
   const constructors = new Map;
   const awsCommands = new Map;
   const googleNamespaces = new Set;
+  const constructorNamespaces = new Map;
   const boto3Namespaces = new Set;
   const pythonOsNamespaces = new Set;
   const pythonGetenvFunctions = new Set;
@@ -11290,6 +11610,9 @@ function importProvenance(tokens, language, analysis) {
             boto3Namespaces.add(local);
           else if (importedModule === "os")
             pythonOsNamespaces.add(local);
+          else if (dotted === importedModule && CONSTRUCTORS_BY_MODULE[importedModule] !== undefined) {
+            constructorNamespaces.set(local, importedModule);
+          }
           if (tokens[scan]?.value === "as")
             scan += 2;
           if (structuralValue(tokens[scan]) !== ",")
@@ -11302,6 +11625,7 @@ function importProvenance(tokens, language, analysis) {
   }
   const importedNames = new Set([
     ...constructors.keys(),
+    ...constructorNamespaces.keys(),
     ...awsCommands.keys(),
     ...googleNamespaces,
     ...boto3Namespaces,
@@ -11328,6 +11652,7 @@ function importProvenance(tokens, language, analysis) {
   }
   for (const name of shadowed) {
     constructors.delete(name);
+    constructorNamespaces.delete(name);
     awsCommands.delete(name);
     googleNamespaces.delete(name);
     boto3Namespaces.delete(name);
@@ -11339,6 +11664,7 @@ function importProvenance(tokens, language, analysis) {
   }
   return {
     constructors,
+    constructorNamespaces,
     awsCommands,
     googleNamespaces,
     boto3Namespaces,
@@ -11349,6 +11675,18 @@ function importProvenance(tokens, language, analysis) {
     aiSdkInstances,
     aiSdkFactories
   };
+}
+function bindingForChain(bindings, chain, language) {
+  const [head, attribute] = chain;
+  if (head === undefined)
+    return;
+  if (head === (language === "python" ? "self" : "this") && attribute !== undefined && chain.length > 2) {
+    const compound = `${head}.${attribute}`;
+    const binding2 = bindings.get(compound) ?? bindings.get(attribute);
+    return binding2 === undefined ? undefined : { binding: binding2, chain: [compound, ...chain.slice(2)] };
+  }
+  const binding = bindings.get(head);
+  return binding === undefined ? undefined : { binding, chain: [...chain] };
 }
 function chainBefore(tokens, openIndex) {
   const chain = [];
@@ -11568,6 +11906,19 @@ function clientBindings(tokens, language, analysis) {
       endpointSafe: true
     };
   };
+  const instanceReceiver = language === "python" ? "self" : "this";
+  const assignmentTarget = (equalsIndex) => {
+    if (tokens[equalsIndex]?.value !== "=")
+      return;
+    const name = tokens[equalsIndex - 1];
+    if (name?.kind !== "identifier")
+      return;
+    const separator = structuralValue(tokens[equalsIndex - 2]);
+    if (separator !== "." && separator !== "?.")
+      return name.value;
+    const receiver = tokens[equalsIndex - 3];
+    return separator === "." && isIdentifier(receiver, instanceReceiver) && !isMemberAccessBefore(tokens, equalsIndex - 3) ? `${instanceReceiver}.${name.value}` : undefined;
+  };
   for (let index = 0;index < tokens.length; index += 1) {
     const token = tokens[index];
     const isNew = language === "javascript" && isIdentifier(token, "new");
@@ -11575,20 +11926,25 @@ function clientBindings(tokens, language, analysis) {
     const localClassName = tokens[classIndex]?.value;
     if (tokens[classIndex]?.kind !== "identifier" || localClassName === undefined)
       continue;
-    const imported = imports.constructors.get(localClassName);
+    let imported = imports.constructors.get(localClassName);
+    let constructorIndex = classIndex;
+    const namespaceModule = imports.constructorNamespaces.get(localClassName);
+    const member = tokens[classIndex + 2];
+    if (imported === undefined && namespaceModule !== undefined && !isMemberAccessBefore(tokens, classIndex) && tokens[classIndex + 1]?.value === "." && member?.kind === "identifier") {
+      const integration = CONSTRUCTORS_BY_MODULE[namespaceModule]?.[member.value];
+      if (integration !== undefined) {
+        imported = { integration, canonicalName: member.value };
+        constructorIndex = classIndex + 2;
+      }
+    }
     if (imported === undefined)
       continue;
-    let variable;
-    if (isNew) {
-      if (tokens[index - 1]?.value === "=" && tokens[index - 2]?.kind === "identifier") {
-        variable = tokens[index - 2]?.value;
-      }
-    } else if (language === "python" && tokens[index - 1]?.value === "=" && tokens[index - 2]?.kind === "identifier") {
-      variable = tokens[index - 2]?.value;
-    }
+    if (!isNew && language === "javascript")
+      continue;
+    const variable = assignmentTarget(index - 1);
     if (variable === undefined)
       continue;
-    const arguments_ = constructorArguments(tokens, classIndex);
+    const arguments_ = constructorArguments(tokens, constructorIndex);
     if (imported.integration === "openai") {
       const platform2 = imported.canonicalName.includes("Azure") ? "azure" : "openai";
       const resolution = resolvedClientPlatform({
@@ -11923,6 +12279,9 @@ function createSemanticFact(input) {
     ]
   };
 }
+function supersedingLiteralSpan(fact, token, resolved) {
+  return fact.platformResolution === "unknown" ? undefined : directSemanticLiteralSpan(token, resolved);
+}
 function directSemanticLiteralSpan(token, resolved) {
   if (token.kind !== "string" || !token.static || resolved.modelResolution !== "resolved" || resolved.modelId === undefined || token.value !== resolved.modelId) {
     return;
@@ -12067,7 +12426,7 @@ function detectAiSdkModelCalls(input) {
       anchor
     });
     facts.push(fact);
-    const literalSpan = directSemanticLiteralSpan(valueToken, resolved);
+    const literalSpan = supersedingLiteralSpan(fact, valueToken, resolved);
     if (literalSpan !== undefined)
       literalSpans.push(literalSpan);
     input.recordConsumedEnvironment(fact, clientBinding, resolved);
@@ -12114,10 +12473,11 @@ function detectSdkCalls(source, path, blobOid, language, scope, jsx = false) {
     if (structuralValue(tokens[openIndex]) !== "(")
       continue;
     const chain = chainBefore(tokens, openIndex);
-    const binding = chain[0] === undefined ? undefined : bindings.get(chain[0]);
-    if (binding === undefined)
+    const bound = bindingForChain(bindings, chain, language);
+    if (bound === undefined)
       continue;
-    const rule = methodRule(binding, chain);
+    const binding = bound.binding;
+    const rule = methodRule(binding, bound.chain);
     if (rule === null)
       continue;
     const closeIndex = matchingIndex(tokens, openIndex, "(", ")");
@@ -12149,7 +12509,7 @@ function detectSdkCalls(source, path, blobOid, language, scope, jsx = false) {
       anchor
     });
     facts.push(fact);
-    const literalSpan = directSemanticLiteralSpan(valueToken, resolved);
+    const literalSpan = supersedingLiteralSpan(fact, valueToken, resolved);
     if (literalSpan !== undefined)
       literalSpans.push(literalSpan);
     recordConsumedEnvironment(fact, effectiveBinding, resolved);
@@ -12208,7 +12568,7 @@ function detectSdkCalls(source, path, blobOid, language, scope, jsx = false) {
         anchor: canonicalCommand
       });
       facts.push(fact);
-      const literalSpan = directSemanticLiteralSpan(tokens[valueIndex], resolved);
+      const literalSpan = supersedingLiteralSpan(fact, tokens[valueIndex], resolved);
       if (literalSpan !== undefined)
         literalSpans.push(literalSpan);
       recordConsumedEnvironment(fact, binding, resolved);
@@ -12347,7 +12707,26 @@ function classifyEvidenceScope(path, semantic = false) {
     return "deployment";
   if (semantic || SOURCE_EXTENSIONS.has(extension))
     return "application";
-  return "unknown";
+  return configurationScope(lower, segments, fileName, extension) ?? "unknown";
+}
+function configurationScope(lowerPath, segments, fileName, extension) {
+  if (GITHUB_WORKFLOW_PATH.test(lowerPath))
+    return "deployment";
+  const dotenv = DOTENV_PATH.test(fileName);
+  const deploymentFile = DEPLOYMENT_FILE_NAMES.has(fileName) || DEPLOYMENT_FILE_PATTERN.test(fileName);
+  if (!dotenv && !deploymentFile && !CONFIGURATION_EXTENSIONS.has(extension))
+    return;
+  const nameParts = fileName.split(".").slice(1);
+  if (nameParts.some((part) => CONFIGURATION_EXAMPLE_PARTS.has(part)))
+    return "example";
+  if (dotenv && nameParts.includes("test"))
+    return "test";
+  if (NON_SELECTING_CONFIGURATION_FILE.test(fileName))
+    return "unknown";
+  if (dotenv || deploymentFile || segments.slice(0, -1).some((segment) => DEPLOYMENT_DIRECTORIES.has(segment))) {
+    return "deployment";
+  }
+  return "application";
 }
 function lexicalCandidates(index) {
   const byId = new Map;
@@ -12476,6 +12855,126 @@ function lexicalFacts(source, path, blobOid, candidates, automaton, semanticLite
     } else {
       column += 1;
     }
+  }
+  return facts;
+}
+var KEYED_LEXICAL_RULE_ID = "fallback.text.keyed-lifecycle-id@1";
+var MAX_KEYED_KEY_LENGTH = 128;
+var MAX_KEYED_GAP = 16;
+var KEY_CHARACTER = /^[A-Za-z0-9_-]$/;
+var NON_ASSIGNMENT_PREFIX = new Set(["=", "!", "<", ">", ":", "+", "-", "*", "/", "%", "&", "|", "^", "~"]);
+function keyedLexicalCandidates(index) {
+  const byId = new Map;
+  for (const pair of index.modelPairs) {
+    if (pair.lexicalScanEligible || pair.conflict || pair.activeLifecycles.length !== 1)
+      continue;
+    const pairs = byId.get(pair.modelId) ?? [];
+    pairs.push(pair);
+    byId.set(pair.modelId, pairs);
+  }
+  for (const pairs of byId.values()) {
+    pairs.sort((left, right) => compareText5(left.servingPlatform, right.servingPlatform));
+  }
+  return byId;
+}
+function isModelKey(key) {
+  const normalized = key.toLowerCase().replace(/[_-]/g, "");
+  return normalized.endsWith("model") || normalized === "modelid" || normalized === "modelname";
+}
+function isKeyedValue(source, start, end, quotesRequired) {
+  const before = source[start - 1];
+  const after = source[end];
+  let cursor = start;
+  if (before === '"' || before === "'" || before === "`") {
+    if (after !== before)
+      return false;
+    cursor = start - 1;
+  } else if (quotesRequired || identifierCharacter(before) || identifierCharacter(characterAt(source, end))) {
+    return false;
+  }
+  const skipGap = (from) => {
+    let index = from;
+    while (index > 0 && from - index < MAX_KEYED_GAP && (source[index - 1] === " " || source[index - 1] === "\t")) {
+      index -= 1;
+    }
+    return index;
+  };
+  cursor = skipGap(cursor);
+  const separator = source[cursor - 1];
+  if (separator !== ":" && separator !== "=")
+    return false;
+  if (NON_ASSIGNMENT_PREFIX.has(source[cursor - 2] ?? ""))
+    return false;
+  cursor = skipGap(cursor - 1);
+  const keyQuote = source[cursor - 1];
+  const quotedKey = keyQuote === '"' || keyQuote === "'";
+  if (quotedKey)
+    cursor -= 1;
+  const keyEnd = cursor;
+  while (cursor > 0 && keyEnd - cursor < MAX_KEYED_KEY_LENGTH && KEY_CHARACTER.test(source[cursor - 1] ?? "")) {
+    cursor -= 1;
+  }
+  if (cursor === keyEnd || quotedKey && source[cursor - 1] !== keyQuote)
+    return false;
+  return isModelKey(source.slice(cursor, keyEnd));
+}
+function keyedLexicalFacts(source, path, blobOid, candidates, semanticLiteralSpans) {
+  if (candidates.size === 0)
+    return [];
+  const scope = classifyEvidenceScope(path);
+  const quotesRequired = SOURCE_EXTENSIONS.has(import_node_path.extname(path.toLowerCase()));
+  const semanticSpans = new Set(semanticLiteralSpans.map((span) => JSON.stringify([span.modelId, span.startOffset, span.endOffset])));
+  const matches = [];
+  for (const [modelId2, pairs] of candidates) {
+    for (let start = source.indexOf(modelId2);start !== -1; start = source.indexOf(modelId2, start + 1)) {
+      const end = start + modelId2.length;
+      if (semanticSpans.has(JSON.stringify([modelId2, start, end])))
+        continue;
+      if (isKeyedValue(source, start, end, quotesRequired))
+        matches.push({ start, modelId: modelId2, pairs });
+    }
+  }
+  matches.sort((left, right) => left.start - right.start || compareText5(left.modelId, right.modelId));
+  const facts = [];
+  let line = 1;
+  let lineStart = 0;
+  let scanned = 0;
+  for (const match of matches) {
+    for (;scanned < match.start; scanned += 1) {
+      if (source[scanned] === `
+`) {
+        line += 1;
+        lineStart = scanned + 1;
+      }
+    }
+    const platforms = [...new Set(match.pairs.map((pair) => pair.servingPlatform))];
+    facts.push({
+      evidenceId: makeEvidenceId(KEYED_LEXICAL_RULE_ID, path, match.modelId, match.modelId, facts.length),
+      origin: "repository",
+      kind: "lexical",
+      confidence: "low",
+      scope,
+      environment: scope === "test" ? "test" : "unknown",
+      detectorRuleId: KEYED_LEXICAL_RULE_ID,
+      detectorManifestVersion: DETECTOR_MANIFEST_VERSION,
+      rawValue: match.modelId,
+      modelId: match.modelId,
+      ...platforms.length === 1 ? { servingPlatform: platforms[0] } : {},
+      modelResolution: "resolved",
+      selectorKind: "model-id",
+      platformResolution: platforms.length === 1 ? "resolved" : "ambiguous",
+      policyEligible: false,
+      locations: [
+        {
+          path,
+          line,
+          column: [...source.slice(lineStart, match.start)].length + 1,
+          blobOid
+        }
+      ],
+      resolutionTrace: [{ kind: "detector", detail: "exact typed-feed ID written as a model key's value" }]
+    });
+    assertEvidenceBudget(facts.length);
   }
   return facts;
 }
@@ -12759,7 +13258,7 @@ function unsupportedFrameworkDiagnostics(byFramework, facts) {
     if (paths.length === 0)
       continue;
     const sorted = paths.sort(compareText5);
-    const preamble = `${framework.displayName} (${framework.frameworkId}) is imported by ${sorted.length} tracked file(s), ` + `${prefix === undefined ? NO_SUPPORT_CAUSE : PARTIAL_SUPPORT_CAUSE}. Model selections made that way ` + "were assessed by bounded lexical fallback only, so they cannot block, are reported only as text " + "matches, and produce nothing at all when the selector is dynamic or the model ID is not " + "literal-scan eligible. Files: ";
+    const preamble = `${framework.displayName} (${framework.frameworkId}) is imported by ${sorted.length} tracked file(s), ` + `${prefix === undefined ? NO_SUPPORT_CAUSE : PARTIAL_SUPPORT_CAUSE}. Model selections made that way ` + "were assessed by bounded lexical fallback only, so they cannot block, are reported only as text " + "matches, and produce nothing at all when the selector is dynamic or the model ID is neither " + "literal-scan eligible nor written as a model key's value. Files: ";
     let sample = sorted.slice(0, MAX_DIAGNOSTIC_SAMPLE_PATHS);
     while (sample.length > 1 && preamble.length + sample.join(", ").length > UNSUPPORTED_FRAMEWORK_MESSAGE_BUDGET) {
       sample = sample.slice(0, -1);
@@ -12803,6 +13302,7 @@ function isClaimDocument(path) {
 function detectSnapshot(snapshot, feed) {
   const candidates = lexicalCandidates(feed);
   const automaton = buildAutomaton(candidates);
+  const keyedCandidates = keyedLexicalCandidates(feed);
   const evidence = [];
   const consumedEnvironmentSelectors = [];
   const diagnostics = snapshot.diagnostics.filter((diagnostic) => diagnostic.coverageImpact === "partial").map((diagnostic) => ({
@@ -12870,7 +13370,8 @@ function detectSnapshot(snapshot, feed) {
         recordUnsupportedFrameworks(unsupportedFrameworkImportsByFramework, unsupportedFrameworkImports(moduleSpecifiers, semantic, semanticLanguage), entry.displayPath);
       }
       const lexical = lexicalFacts(source, entry.displayPath, entry.objectId, candidates, automaton, literalSpans);
-      evidence.push(...semantic, ...lexical);
+      const keyed = keyedLexicalFacts(source, entry.displayPath, entry.objectId, keyedCandidates, literalSpans);
+      evidence.push(...semantic, ...lexical, ...keyed);
       assertEvidenceBudget(evidence.length);
     }
     if (consumedEnvironmentSelectors.length > 0) {
@@ -14456,6 +14957,7 @@ function parseActionInputs(environment) {
   const rawMaxFeedAge = getInput("max-feed-age-days", environment);
   const slackWebhook = getInput("slack-webhook", environment);
   const rawNotificationFailure = getInput("notification-failure-mode", environment);
+  const rawSlackNotify = getInput("slack-notify", environment);
   const warnWithinDays = parseOptionalInteger(rawWarn, "warn-within-days", {
     max: MAX_POLICY_DAYS
   });
@@ -14468,11 +14970,16 @@ function parseActionInputs(environment) {
   if (notificationFailureMode !== "fail" && notificationFailureMode !== "warn") {
     throw new Error("Invalid notification-failure-mode: expected `fail` or `warn`.");
   }
+  const slackNotify = rawSlackNotify?.toLowerCase() || "always";
+  if (slackNotify !== "always" && slackNotify !== "findings") {
+    throw new Error("Invalid slack-notify: expected `always` or `findings`.");
+  }
   const result = {
     warnWithinDays,
     failWithinDays,
     allowPartial,
     maxFeedAgeDays,
+    slackNotify,
     notificationFailureMode
   };
   if (slackWebhook)
@@ -14569,10 +15076,9 @@ function partitionFindings(report) {
     const tierDifference = Number(isTextMatch(left)) - Number(isTextMatch(right));
     if (tierDifference !== 0)
       return tierDifference;
-    const leftDays = earliestLifecycleDays(left) ?? Number.POSITIVE_INFINITY;
-    const rightDays = earliestLifecycleDays(right) ?? Number.POSITIVE_INFINITY;
-    if (leftDays !== rightDays)
-      return leftDays - rightDays;
+    const dayDifference = shutdownOrderDays(left) - shutdownOrderDays(right);
+    if (dayDifference !== 0)
+      return dayDifference;
     const platformDifference = compareText7(left.servingPlatform, right.servingPlatform);
     return platformDifference !== 0 ? platformDifference : compareText7(left.modelId, right.modelId);
   });
@@ -14580,21 +15086,6 @@ function partitionFindings(report) {
     listed,
     withheld: notifiable.filter((finding) => PROTECTED_SCOPES2.has(finding.scope))
   };
-}
-function dateText(label, date, days) {
-  if (days === null || days === undefined || !Number.isSafeInteger(days)) {
-    return `${label} ${date}`;
-  }
-  if (days < 0)
-    return `${label} ${date} (${Math.abs(days)}d overdue)`;
-  if (days === 0)
-    return `${label} ${date} (today)`;
-  return `${label} ${date} (${days}d)`;
-}
-function deadlineText(finding) {
-  if (finding.shutdownDate === undefined)
-    return "shutdown date not announced";
-  return dateText("shutdown", finding.shutdownDate, finding.daysUntilShutdown);
 }
 function safeLink(candidate) {
   if (candidate === undefined)
@@ -14626,11 +15117,10 @@ function findingLabel(finding) {
   return isTextMatch(finding) ? "ADVISORY (text match)" : "ADVISORY";
 }
 function findingLine(finding) {
-  const qualifiers = [];
-  if (deprecationLeadsHorizon(finding) && finding.deprecationDate !== undefined) {
-    qualifiers.push(dateText("deprecation", finding.deprecationDate, finding.daysUntilDeprecation));
-  }
-  qualifiers.push(deadlineText(finding));
+  const qualifiers = [shutdownText(finding)];
+  const deprecation = deprecationText(finding);
+  if (deprecation !== null)
+    qualifiers.push(deprecation);
   if (finding.delta !== undefined && finding.delta !== "unchanged") {
     qualifiers.push(finding.delta);
   }
@@ -14733,11 +15223,20 @@ function safeFailureDetail(error) {
     return "Slack webhook request timed out.";
   return "Slack webhook delivery failed.";
 }
+function snapshotHasFindings(report) {
+  return report.result !== "no-actionable-risk" || report.scanStatus !== "complete" || report.evidenceHealth !== "current";
+}
 async function deliverSlackNotification(options) {
   if (!TRUSTED_NOTIFICATION_EVENTS.has(options.report.event.eventName) || options.report.event.targetKind !== "commit") {
     return {
       status: "skipped",
       detail: `Slack snapshots are disabled for ${slackText(options.report.event.eventName, 80)} events.`
+    };
+  }
+  if (options.notify === "findings" && !snapshotHasFindings(options.report)) {
+    return {
+      status: "skipped",
+      detail: "No blocking or advisory finding and coverage is complete; slack-notify is `findings`."
     };
   }
   let webhookUrl;
@@ -14762,8 +15261,13 @@ var MAX_TOTAL_OUTPUT_BYTES = 700 * 1024;
 var MAX_REPORT_BYTES = 25 * 1024 * 1024;
 var MAX_ANNOTATIONS = 10;
 var MAX_COVERAGE_ANNOTATIONS = 5;
+var IMMINENT_SHUTDOWN_DAYS = 30;
+var MAX_IMMINENT_NOTICES = 20;
 function escapeHtml(value) {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/#/g, "&#35;").replace(/\\/g, "&#92;").replace(/\|/g, "&#124;").replace(/`/g, "&#96;").replace(/\[/g, "&#91;").replace(/\]/g, "&#93;").replace(/!/g, "&#33;").replace(/\(/g, "&#40;").replace(/\)/g, "&#41;").replace(/\*/g, "&#42;").replace(/_/g, "&#95;").replace(/~/g, "&#126;").replace(/@/g, "&#64;").replace(/:/g, "&#58;").replace(/\./g, "&#46;").replace(/[\r\n]+/g, "<br>");
+}
+function byShutdown(findings) {
+  return [...findings].sort((left, right) => shutdownOrderDays(left) - shutdownOrderDays(right));
 }
 function resultIcon3(report) {
   return resultIcon(report.result, report.scanStatus);
@@ -14781,27 +15285,34 @@ function deliveryLine(report, options = {}) {
   }
   return `Delivery: GitHub Actions summary; Slack skipped (${escapeHtml(compact(report.notificationReason, 300))})`;
 }
-function deadlineCell(finding) {
-  if (deprecationLeadsHorizon(finding) && finding.deprecationDate !== undefined) {
-    return `deprecation ${escapeHtml(finding.deprecationDate)} (${finding.daysUntilDeprecation ?? "?"}d)`;
-  }
-  return finding.shutdownDate === undefined ? "Not announced" : `shutdown ${escapeHtml(finding.shutdownDate)} (${finding.daysUntilShutdown ?? "?"}d)`;
+function lifecycleCell(finding) {
+  const shutdown = escapeHtml(shutdownText(finding));
+  const lead = finding.daysUntilShutdown !== null && finding.daysUntilShutdown <= 0 ? `**${shutdown}**` : shutdown;
+  const deprecation = deprecationText(finding);
+  return deprecation === null ? lead : `${lead} · ${escapeHtml(deprecation)}`;
 }
 function findingRow(finding) {
   const delta = finding.delta === undefined ? "—" : finding.delta;
-  return `| <code>${escapeHtml(compact(finding.modelId, 160))}</code> | ${escapeHtml(compact(servingPlatformLabel(finding), 300))} | ${escapeHtml(finding.outcome)} | ${escapeHtml(delta)} | ${deadlineCell(finding)} |`;
+  return `| <code>${escapeHtml(compact(finding.modelId, 160))}</code> | ${escapeHtml(compact(servingPlatformLabel(finding), 300))} | ${escapeHtml(finding.outcome)} | ${escapeHtml(delta)} | ${lifecycleCell(finding)} |`;
+}
+function imminentNoticeLine(finding) {
+  const location = finding.locations[0];
+  return `- <code>${escapeHtml(compact(finding.modelId, 160))}</code> on ${escapeHtml(compact(servingPlatformLabel(finding), 300))} — ${escapeHtml(shutdownText(finding))} · ${finding.scope}${location === undefined ? "" : ` · <code>${escapeHtml(compact(location.path, 300))}</code>`}`;
 }
 function renderSummary(report, options = {}) {
-  const actionable = report.lifecycleFindings.filter((finding) => finding.outcome === "breach" || finding.outcome === "warning");
+  const actionable = byShutdown(report.lifecycleFindings.filter((finding) => finding.outcome === "breach" || finding.outcome === "warning"));
   const visibleSources = report.evidenceSources.slice(0, 20);
   const hiddenSourceCount = report.evidenceSources.length - visibleSources.length;
   const sourceText = report.evidenceSources.length === 1 ? "repository only" : `${visibleSources.map((source) => `${compact(source.id, 180)} (${source.kind}, ${source.health})`).join(" + ")}${hiddenSourceCount > 0 ? ` + ${hiddenSourceCount} more` : ""}`;
+  const notAssessed = report.diagnostics.filter((diagnostic) => NOT_ASSESSED_DIAGNOSTICS.has(diagnostic.code));
+  const listedDiagnostics = report.diagnostics.filter((diagnostic) => !NOT_ASSESSED_DIAGNOSTICS.has(diagnostic.code));
   const lines = [
     "## AI model lifecycle",
     "",
     `${resultIcon3(report)} **${report.result}** · ${report.counts.blocking} blocking · ${report.counts.advisory} advisory · ${report.counts.unresolved} unresolved`,
     "",
     `Evidence: ${escapeHtml(sourceText)} · Scan: ${report.scanStatus} · Comparison: ${report.comparisonStatus}`,
+    ...notAssessed.map((diagnostic) => `Not assessed: ${escapeHtml(compact(diagnostic.message, 800))}`),
     deliveryLine(report, options),
     ""
   ];
@@ -14813,10 +15324,14 @@ function renderSummary(report, options = {}) {
       lines.push("No runtime or control-plane evidence source was supplied; those systems were not assessed.", "");
     }
   } else {
-    lines.push("### Actionable lifecycle findings", "", "| Model | Serving platform | Outcome | Change | Next lifecycle date |", "| --- | --- | --- | --- | --- |", ...actionable.slice(0, 100).map(findingRow), "");
+    lines.push("### Actionable lifecycle findings", "", "| Model | Serving platform | Outcome | Change | Lifecycle |", "| --- | --- | --- | --- | --- |", ...actionable.slice(0, 100).map(findingRow), "");
     if (actionable.length > 100) {
       lines.push(`${actionable.length - 100} additional finding(s) are in the local JSON report.`, "");
     }
+  }
+  const imminent = byShutdown(report.lifecycleFindings.filter((finding) => finding.outcome === "notice" && finding.scope !== "application" && finding.scope !== "deployment" && finding.delta !== "resolved" && finding.daysUntilShutdown !== null && finding.daysUntilShutdown >= 0 && finding.daysUntilShutdown <= IMMINENT_SHUTDOWN_DAYS));
+  if (imminent.length > 0) {
+    lines.push(`### Shutting down within ${IMMINENT_SHUTDOWN_DAYS} days outside application and deployment scope`, "", ...imminent.slice(0, MAX_IMMINENT_NOTICES).map(imminentNoticeLine), ...imminent.length > MAX_IMMINENT_NOTICES ? [`- ${imminent.length - MAX_IMMINENT_NOTICES} more in the local JSON report.`] : [], "");
   }
   if (report.unresolvedReferences.length > 0) {
     lines.push("### Conditional and unresolved evidence", "", ...report.unresolvedReferences.slice(0, 50).map((fact) => {
@@ -14835,8 +15350,8 @@ function renderSummary(report, options = {}) {
   if (suppressed.length > 0) {
     lines.push("### Active suppressions", "", ...suppressed.slice(0, 100).map((finding) => `- <code>${escapeHtml(compact(finding.modelId, 160))}</code> on ${escapeHtml(compact(servingPlatformLabel(finding), 300))} — <code>${escapeHtml(compact(finding.suppressedBy, 160))}</code>`), ...suppressed.length > 100 ? [`- ${suppressed.length - 100} additional suppressed finding(s) are in the JSON report.`] : [], "");
   }
-  if (report.diagnostics.length > 0) {
-    lines.push("<details>", "<summary>Coverage and provenance diagnostics</summary>", "", ...report.diagnostics.slice(0, 200).map((diagnostic) => `- ${escapeHtml(compact(diagnostic.code, 180))}${diagnostic.path === undefined ? "" : ` · <code>${escapeHtml(compact(diagnostic.path, 300))}</code>`}: ${escapeHtml(compact(diagnostic.message, 800))}`), "", "</details>", "");
+  if (listedDiagnostics.length > 0) {
+    lines.push("<details>", "<summary>Coverage and provenance diagnostics</summary>", "", ...listedDiagnostics.slice(0, 200).map((diagnostic) => `- ${escapeHtml(compact(diagnostic.code, 180))}${diagnostic.path === undefined ? "" : ` · <code>${escapeHtml(compact(diagnostic.path, 300))}</code>`}: ${escapeHtml(compact(diagnostic.message, 800))}`), "", "</details>", "");
   }
   const feedFreshness = report.feed.generatedAt === "" || report.feed.ageDays === null ? "unavailable" : `${escapeHtml(report.feed.generatedAt)} (${report.feed.ageDays}d old)`;
   lines.push(`Feed: source <code>${report.feed.sourceFeedSha256}</code> · active <code>${report.feed.activeRecordsSha256}</code> · generated ${feedFreshness}`, `Detector manifest: <code>${report.detectorManifestSha256}</code> · Report: <code>${escapeHtml(compact(report.reportPath, 500))}</code>`, "");
@@ -14844,12 +15359,11 @@ function renderSummary(report, options = {}) {
 `);
 }
 function annotationText(finding) {
-  const deadline = finding.shutdownDate === undefined ? "shutdown date not announced" : `shutdown ${finding.shutdownDate} (${finding.daysUntilShutdown ?? "?"} day(s))`;
-  const deprecation = deprecationLeadsHorizon(finding) && finding.deprecationDate !== undefined ? `deprecation ${finding.deprecationDate} (${finding.daysUntilDeprecation ?? "?"} day(s)), ` : "";
-  return `${finding.modelId} on ${servingPlatformLabel(finding)}: ${deprecation}${deadline}. ${finding.reasons.join(" ")}`;
+  const deprecation = deprecationText(finding);
+  return `${finding.modelId} on ${servingPlatformLabel(finding)}: ${shutdownText(finding)}${deprecation === null ? "" : `, ${deprecation}`}. ${finding.reasons.join(" ")}`;
 }
 function publishAnnotations(report, log = console.log) {
-  const actionable = report.lifecycleFindings.filter((finding) => (finding.outcome === "breach" || finding.outcome === "warning") && finding.delta !== "unchanged" && finding.delta !== "resolved");
+  const actionable = byShutdown(report.lifecycleFindings.filter((finding) => (finding.outcome === "breach" || finding.outcome === "warning") && finding.delta !== "unchanged" && finding.delta !== "resolved"));
   let emitted = 0;
   for (const finding of actionable) {
     if (emitted >= MAX_ANNOTATIONS)
@@ -15491,6 +16005,7 @@ var DEFAULT_INPUTS = {
   failWithinDays: null,
   allowPartial: null,
   maxFeedAgeDays: DEFAULT_MAX_FEED_AGE_DAYS,
+  slackNotify: "always",
   notificationFailureMode: "fail"
 };
 
@@ -15968,7 +16483,7 @@ async function assess(dependencies, environment2, evaluatedAtMs, localReportPath
     const diagnostics = [
       ...resolvedEvent.diagnostics,
       ...comparison.evaluation.diagnostics,
-      ...comparison.baseline.diagnostics,
+      ...comparison.baseline.diagnostics.filter((diagnostic) => !NOT_ASSESSED_DIAGNOSTICS.has(diagnostic.code)),
       ...feedDiagnostics(feed, freshness)
     ];
     const scanStatus = applyFeedFreshnessCoverage(comparison.scanStatus, freshness);
@@ -16078,7 +16593,8 @@ async function run(dependencies = {}) {
       const deliver = dependencies.deliverNotification ?? deliverSlackNotification;
       const delivery = await deliver({
         webhookUrl: product.inputs.slackWebhook,
-        report
+        report,
+        notify: product.inputs.slackNotify
       });
       report.notificationStatus = delivery.status;
       report.notificationReason = delivery.detail ?? (delivery.status === "sent" ? "Slack snapshot delivered" : "Slack snapshot delivery was skipped");

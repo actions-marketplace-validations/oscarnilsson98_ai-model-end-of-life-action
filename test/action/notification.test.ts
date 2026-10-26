@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { deliverSlackNotification } from "../../src/action/notification.ts";
 import type {
   AssessmentReport,
+  EvidenceFact,
   LifecycleFinding,
 } from "../../src/shared/types.ts";
 
@@ -30,6 +31,29 @@ function finding(overrides: Partial<LifecycleFinding> = {}): LifecycleFinding {
     confidence: "high",
     selectorKind: "model-id",
     locations: [{ path: "/secret/workspace/src/chat.ts", line: 1, column: 1 }],
+    ...overrides,
+  };
+}
+
+/** A typed call site whose selector is computed at runtime: reportable, never a finding. */
+function unresolvedFact(overrides: Partial<EvidenceFact> = {}): EvidenceFact {
+  return {
+    evidenceId: "unresolved-google",
+    origin: "repository",
+    kind: "sdk-argument",
+    confidence: "high",
+    scope: "application",
+    environment: "production",
+    detectorRuleId: "source.ts.vercel-ai-sdk.google-model@1",
+    detectorManifestVersion: "1",
+    rawValue: "modelId",
+    servingPlatform: "google",
+    modelResolution: "dynamic",
+    selectorKind: "dynamic",
+    platformResolution: "resolved",
+    policyEligible: false,
+    locations: [{ path: "packages/ai-client/src/provider.ts", line: 28, column: 12 }],
+    resolutionTrace: [],
     ...overrides,
   };
 }
@@ -146,6 +170,78 @@ function payloadText(request: CapturedRequest): string {
 }
 
 describe("v3 Slack snapshot delivery", () => {
+  test("slack-notify findings skips only a clean, fully assessed, current snapshot", async () => {
+    const attempt = async (assessment: AssessmentReport, notify: "always" | "findings") => {
+      let posted = false;
+      const result = await deliverSlackNotification({
+        webhookUrl: WEBHOOK,
+        report: assessment,
+        notify,
+        fetchImpl: async () => {
+          posted = true;
+          return new Response(null, { status: 204 });
+        },
+      });
+      return { status: result.status, detail: result.detail, posted };
+    };
+
+    const clean = report();
+    expect(await attempt(clean, "findings")).toEqual({
+      status: "skipped",
+      detail: "No blocking or advisory finding and coverage is complete; slack-notify is `findings`.",
+      posted: false,
+    });
+    expect(await attempt(clean, "always")).toMatchObject({ status: "sent", posted: true });
+
+    // Anything to act on still posts — including a degraded scan, since a quiet channel
+    // during a feed outage would read exactly like an all-clear.
+    for (const [name, assessment] of [
+      ["advisory", report({ result: "advisory", lifecycleFindings: [finding()] })],
+      ["blocking", report({ result: "blocking", lifecycleFindings: [finding({ outcome: "breach" })] })],
+      ["partial scan", report({ scanStatus: "partial" })],
+      ["unknown result", report({ result: "unknown", scanStatus: "failed" })],
+      ["stale evidence", report({ evidenceHealth: "stale" })],
+    ] as const) {
+      expect(await attempt(assessment, "findings"), name).toMatchObject({
+        status: "sent",
+        posted: true,
+      });
+    }
+  });
+
+  test("leaves unresolved selectors out of the snapshot and keeps a clean result clean", async () => {
+    const base = report();
+    const text = await deliveredText(
+      report({
+        unresolvedReferences: [
+          unresolvedFact(),
+          unresolvedFact({
+            evidenceId: "unresolved-openai",
+            detectorRuleId: "source.ts.vercel-ai-sdk.openai-model@1",
+            servingPlatform: "openai",
+            locations: [
+              { path: "packages/ai-client/src/provider.ts", line: 39, column: 12 },
+            ],
+          }),
+        ],
+        counts: {
+          ...base.counts,
+          unresolved: 2,
+          byResolution: { resolved: 0, dynamic: 2, unresolved: 0 },
+        },
+      }),
+    );
+
+    // A selector computed at runtime cannot be checked, but it is not a finding either:
+    // the job summary states it once, and a daily snapshot repeating it would be noise.
+    expect(text).toContain("✅");
+    expect(text).toContain("Result:* no-actionable-risk");
+    expect(text).toContain("0 blocking · 0 advisory · 2 unresolved");
+    expect(text).not.toContain("Unresolved selectors");
+    expect(text).not.toContain("provider.ts");
+    expect(text).not.toContain("vercel-ai-sdk");
+  });
+
   test("sends a clean bounded snapshot with authoritative event identity", async () => {
     const requests: CapturedRequest[] = [];
     const assessment = report();
@@ -263,7 +359,7 @@ describe("v3 Slack snapshot delivery", () => {
     const text = payloadText(captured as CapturedRequest);
     expect(text.indexOf("BLOCKING")).toBeLessThan(text.indexOf("ADVISORY"));
     expect(text).toContain("danger&lt;@​U123&gt;@​channel＿∗ˋ");
-    expect(text).toContain("2d overdue");
+    expect(text).toContain("shut down 2026-08-20 (2d ago)");
     expect(text).toContain("medium-advisory");
     expect(text).toContain("review-overdue");
     // Verified findings outrank the text match, which the bounded view then defers.
@@ -285,7 +381,7 @@ describe("v3 Slack snapshot delivery", () => {
     expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(12_000);
   });
 
-  test("names the deprecation date and orders by the nearest lifecycle date", async () => {
+  test("leads with the shutdown, names the deprecation, and orders by shutdown", async () => {
     let captured: CapturedRequest | undefined;
     const assessment = report({
       result: "advisory",
@@ -318,10 +414,10 @@ describe("v3 Slack snapshot delivery", () => {
 
     expect(result.status).toBe("sent");
     const text = payloadText(captured as CapturedRequest);
-    expect(text).toContain("deprecation 2026-06-01 (62d overdue)");
-    expect(text).toContain("shutdown 2027-06-01 (303d)");
-    // The already-deprecated model is the more urgent of the two.
-    expect(text.indexOf("already-deprecated")).toBeLessThan(text.indexOf("shutting-down-soon"));
+    expect(text).toContain("shutdown 2027-06-01 (in 303d) · deprecated 2026-06-01 (62d ago)");
+    expect(text).toContain("shutdown 2026-09-01 (in 30d)");
+    // The model that stops serving first leads, however long ago the other was deprecated.
+    expect(text.indexOf("shutting-down-soon")).toBeLessThan(text.indexOf("already-deprecated"));
   });
 
   test("names low-confidence findings an advisory result counted", async () => {
